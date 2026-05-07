@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>THE RENDER WAVE - Gerador de Imagens</title>
+    <style>
+        :root {
+            --bg: #0f0f1a;
+            --card: #1a1a2e;
+            --accent: #00d4ff;
+            --text: #e0e0e0;
+            --muted: #888;
+            --border: #2a2a40;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            padding: 40px 20px;
+        }
+        .container {
+            width: 100%;
+            max-width: 900px;
+        }
+        h1 {
+            text-align: center;
+            color: var(--accent);
+            margin-bottom: 8px;
+            font-size: 1.8rem;
+        }
+        .subtitle {
+            text-align: center;
+            color: var(--muted);
+            margin-bottom: 30px;
+            font-size: 0.95rem;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+        .full { grid-column: 1 / -1; }
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 6px;
+            font-size: 0.85rem;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        input[type="text"],
+        input[type="number"],
+        textarea,
+        select {
+            width: 100%;
+            padding: 10px 14px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--bg);
+            color: var(--text);
+            font-size: 0.95rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        input:focus, textarea:focus, select:focus {
+            border-color: var(--accent);
+        }
+        textarea { resize: vertical; min-height: 80px; }
+        .row { display: flex; gap: 12px; }
+        .row > div { flex: 1; }
+        button.generate {
+            width: 100%;
+            padding: 16px;
+            border: none;
+            border-radius: 10px;
+            background: linear-gradient(135deg, #00d4ff, #0099cc);
+            color: #000;
+            font-size: 1.1rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: opacity 0.2s, transform 0.1s;
+            margin-top: 10px;
+        }
+        button.generate:hover { opacity: 0.9; }
+        button.generate:active { transform: scale(0.98); }
+        button.generate:disabled {
+            background: #333;
+            color: #666;
+            cursor: not-allowed;
+        }
+        .result {
+            margin-top: 24px;
+            display: none;
+        }
+        .result.active { display: block; }
+        .images-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 16px;
+            margin-top: 16px;
+        }
+        .img-card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        .img-card img {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+        .img-card .info {
+            padding: 10px;
+            font-size: 0.8rem;
+            color: var(--muted);
+            word-break: break-all;
+        }
+        .log {
+            margin-top: 16px;
+            padding: 14px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 0.8rem;
+            max-height: 200px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+        }
+        .error { color: #ff5555; }
+        .ok { color: #55ff55; }
+        @media (max-width: 640px) {
+            .grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>THE RENDER WAVE</h1>
+        <p class="subtitle">Gerador de Imagens via ComfyUI</p>
+
+        <div class="card">
+            <div class="grid">
+                <div class="full">
+                    <label for="prompt">Prompt (positivo)</label>
+                    <textarea id="prompt" placeholder="Descreve a imagem que queres gerar...">cyberpunk sunset city</textarea>
+                </div>
+                <div class="full">
+                    <label for="negative">Prompt Negativo</label>
+                    <textarea id="negative">text, watermark, ugly, blurry, low quality</textarea>
+                </div>
+                <div>
+                    <label for="width">Largura</label>
+                    <select id="width">
+                        <option value="512">512</option>
+                        <option value="768">768</option>
+                        <option value="1024" selected>1024</option>
+                        <option value="1344">1344</option>
+                        <option value="2048">2048</option>
+                    </select>
+                </div>
+                <div>
+                    <label for="height">Altura</label>
+                    <select id="height">
+                        <option value="512">512</option>
+                        <option value="576" selected>576</option>
+                        <option value="768">768</option>
+                        <option value="1152">1152</option>
+                        <option value="1536">1536</option>
+                    </select>
+                </div>
+                <div>
+                    <label for="batch">Número de Imagens</label>
+                    <input id="batch" type="number" min="1" max="8" value="1">
+                </div>
+                <div>
+                    <label for="seed">Seed (-1 = aleatório)</label>
+                    <input id="seed" type="number" value="-1">
+                </div>
+                <div>
+                    <label for="steps">Steps</label>
+                    <input id="steps" type="number" min="1" max="150" value="70">
+                </div>
+                <div>
+                    <label for="cfg">CFG Scale</label>
+                    <input id="cfg" type="number" min="1" max="30" step="0.5" value="8">
+                </div>
+                <div class="full">
+                    <button class="generate" id="btn">Gerar Imagem</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="result" id="result">
+            <div class="card">
+                <h3 style="margin-bottom: 12px;">Resultado</h3>
+                <div id="images" class="images-grid"></div>
+                <div id="log" class="log"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const btn = document.getElementById('btn');
+        const result = document.getElementById('result');
+        const imagesDiv = document.getElementById('images');
+        const logDiv = document.getElementById('log');
+
+        function log(msg, isError = false) {
+            const span = document.createElement('span');
+            span.textContent = msg + '\n';
+            span.className = isError ? 'error' : 'ok';
+            logDiv.appendChild(span);
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        btn.addEventListener('click', async () => {
+            btn.disabled = true;
+            btn.textContent = 'A gerar...';
+            result.classList.remove('active');
+            imagesDiv.innerHTML = '';
+            logDiv.innerHTML = '';
+            result.classList.add('active');
+
+            const payload = {
+                prompt: document.getElementById('prompt').value,
+                negative: document.getElementById('negative').value,
+                width: parseInt(document.getElementById('width').value),
+                height: parseInt(document.getElementById('height').value),
+                batch: parseInt(document.getElementById('batch').value),
+                seed: parseInt(document.getElementById('seed').value),
+                steps: parseInt(document.getElementById('steps').value),
+                cfg: parseFloat(document.getElementById('cfg').value)
+            };
+
+            log('[INFO] A enviar pedido para o servidor...');
+
+            try {
+                const res = await fetch('/generate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const data = await res.json();
+
+                if (data.status === 'success') {
+                    log('[OK] Imagens geradas com sucesso!');
+                    log('Prompt ID: ' + data.prompt_id);
+
+                    data.images.forEach(img => {
+                        const card = document.createElement('div');
+                        card.className = 'img-card';
+
+                        const foto = document.createElement('img');
+                        // O servidor serve o ficheiro directamente
+                        foto.src = '/image/' + encodeURIComponent(img.filename);
+                        foto.alt = img.filename;
+
+                        const info = document.createElement('div');
+                        info.className = 'info';
+                        info.textContent = img.filename;
+
+                        card.appendChild(foto);
+                        card.appendChild(info);
+                        imagesDiv.appendChild(card);
+                    });
+                } else {
+                    log('[ERRO] ' + (data.message || 'Erro desconhecido'), true);
+                }
+            } catch (err) {
+                log('[ERRO] ' + err.message, true);
+                log('Verifique se o servidor Flask esta a correr na porta 5000.', true);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Gerar Imagem';
+            }
+        });
+    </script>
+</body>
+</html>

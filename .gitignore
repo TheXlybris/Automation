@@ -1,0 +1,37 @@
+# Ambiente virtual Python
+venv/
+env/
+ENV/
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Logs
+*.log
+
+# Configuracoes locais
+.env
+.env.local
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Outputs temporarios
+output_test.log
+
+# Pastas de output (imagens geradas nao vao para o repo)
+output/
+images/
+
+# Dependencias (se decidirmos usar requirements.txt no futuro)
+# requirements.txt
