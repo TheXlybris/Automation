@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>THE RENDER WAVE - Gerador de Videos</title>
+    <style>
+        :root {
+            --bg: #0f0f1a;
+            --card: #1a1a2e;
+            --accent: #00d4ff;
+            --accent2: #ff6b6b;
+            --text: #e0e0e0;
+            --muted: #888;
+            --border: #2a2a40;
+            --success: #55ff55;
+            --warn: #ffaa00;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            padding: 40px 20px;
+        }
+        .container {
+            width: 100%;
+            max-width: 1000px;
+        }
+        h1 {
+            text-align: center;
+            color: var(--accent);
+            margin-bottom: 8px;
+            font-size: 1.8rem;
+        }
+        .subtitle {
+            text-align: center;
+            color: var(--muted);
+            margin-bottom: 30px;
+            font-size: 0.95rem;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+        .full { grid-column: 1 / -1; }
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 6px;
+            font-size: 0.85rem;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        input[type="text"],
+        input[type="number"],
+        textarea,
+        select {
+            width: 100%;
+            padding: 10px 14px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--bg);
+            color: var(--text);
+            font-size: 0.95rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        input:focus, textarea:focus, select:focus {
+            border-color: var(--accent);
+        }
+        textarea { resize: vertical; min-height: 80px; }
+        .row { display: flex; gap: 12px; }
+        .row > div { flex: 1; }
+        button.generate {
+            width: 100%;
+            padding: 16px;
+            border: none;
+            border-radius: 10px;
+            background: linear-gradient(135deg, #00d4ff, #0099cc);
+            color: #000;
+            font-size: 1.1rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: opacity 0.2s, transform 0.1s;
+            margin-top: 10px;
+        }
+        button.generate:hover { opacity: 0.9; }
+        button.generate:active { transform: scale(0.98); }
+        button.generate:disabled {
+            background: #333;
+            color: #666;
+            cursor: not-allowed;
+        }
+        button.secondary {
+            padding: 8px 14px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--bg);
+            color: var(--text);
+            font-size: 0.85rem;
+            cursor: pointer;
+        }
+        button.secondary:hover { border-color: var(--accent); }
+        .result {
+            margin-top: 24px;
+            display: none;
+        }
+        .result.active { display: block; }
+        .log {
+            margin-top: 16px;
+            padding: 14px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 0.8rem;
+            max-height: 200px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+        }
+        .error { color: #ff5555; }
+        .ok { color: var(--success); }
+        .warn { color: var(--warn); }
+        .info { color: var(--accent); }
+
+        /* Lista de imagens */
+        .image-picker {
+            max-height: 200px;
+            overflow-y: auto;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 8px;
+            background: var(--bg);
+        }
+        .image-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 6px;
+            cursor: pointer;
+            border-radius: 6px;
+            transition: background 0.15s;
+        }
+        .image-item:hover { background: #2a2a50; }
+        .image-item.selected { background: #1a3a5a; border: 1px solid var(--accent); }
+        .image-item img {
+            width: 48px;
+            height: 48px;
+            object-fit: cover;
+            border-radius: 4px;
+            background: #333;
+        }
+        .image-item span {
+            font-size: 0.8rem;
+            color: var(--muted);
+        }
+        .preview-img {
+            max-width: 100%;
+            max-height: 200px;
+            border-radius: 8px;
+            margin-top: 8px;
+            border: 1px solid var(--border);
+        }
+        video {
+            width: 100%;
+            max-height: 400px;
+            border-radius: 8px;
+            margin-top: 8px;
+        }
+        .prompt-preview {
+            background: #0a1525;
+            border: 1px solid #1a3a5a;
+            border-radius: 8px;
+            padding: 12px;
+            margin-top: 8px;
+            font-size: 0.85rem;
+            color: #88bbff;
+            max-height: 120px;
+            overflow-y: auto;
+        }
+        .toggle-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 8px;
+        }
+        .toggle-row input[type="checkbox"] {
+            width: auto;
+        }
+        @media (max-width: 640px) {
+            .grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>THE RENDER WAVE</h1>
+        <p class="subtitle">Gerador de Videos (LTX Video img2vid)</p>
+
+        <div class="card">
+            <div class="grid">
+                <!-- Escolha de imagem -->
+                <div class="full">
+                    <label>Imagem de Input</label>
+                    <div style="display:flex; gap:10px; margin-bottom:8px;">
+                        <button class="secondary" id="btnLoadImages">Recarregar Imagens</button>
+                        <span id="imgCount" style="color:var(--muted); font-size:0.85rem; align-self:center;"></span>
+                    </div>
+                    <div class="image-picker" id="imageList">
+                        <div style="color:var(--muted); font-size:0.85rem; padding:10px;">Clique em "Recarregar Imagens" para listar imagens do ComfyUI</div>
+                    </div>
+                    <div id="selectedImagePreview"></div>
+                    <input type="hidden" id="selectedImagePath" value="">
+                </div>
+
+                <!-- Prompt Imagem -->
+                <div class="full">
+                    <label for="imgPrompt">Prompt da Imagem (origem)</label>
+                    <textarea id="imgPrompt" placeholder="Cole aqui o prompt usado para gerar a imagem...">masterpiece, best quality, photorealistic, highly detailed, a small picturesque waterfall cascading gently over mossy rocks into a crystal-clear shallow pool, surrounded by lush green grass and vibrant wildflowers like daisies, poppies and lavender, water droplets sparkling in the air, soft golden hour sunlight filtering through nearby trees, warm and serene atmosphere</textarea>
+                    <div class="toggle-row">
+                        <input type="checkbox" id="chkTranslate" checked>
+                        <label for="chkTranslate" style="margin:0; text-transform:none; font-size:0.9rem; color:var(--text);">Traduzir automaticamente para prompt de video</label>
+                    </div>
+                </div>
+
+                <!-- Preview do prompt traduzido -->
+                <div class="full">
+                    <label>Prompt de Video (preview traducao)</label>
+                    <div class="prompt-preview" id="videoPromptPreview">
+                        (Ative a traducao e escreva um prompt de imagem para ver a versao de video)
+                    </div>
+                    <div class="toggle-row">
+                        <input type="checkbox" id="chkManualVideo">
+                        <label for="chkManualVideo" style="margin:0; text-transform:none; font-size:0.9rem; color:var(--text);">Usar prompt de video manual (ignora traducao)</label>
+                    </div>
+                    <textarea id="videoPromptManual" placeholder="Prompt de video manual (so ativo se checkbox acima ligado)..." style="margin-top:8px; display:none;"></textarea>
+                </div>
+
+                <!-- Prompt Negativo -->
+                <div class="full">
+                    <label for="negative">Prompt Negativo</label>
+                    <textarea id="negative">low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, artifacts, fused fingers, bad anatomy, weird hand, ugly</textarea>
+                </div>
+
+                <div>
+                    <label for="strength">Strength (0.0 - 1.0)</label>
+                    <input id="strength" type="number" min="0" max="1" step="0.01" value="0.15">
+                </div>
+                <div>
+                    <label for="lengthSlider">Duracao (segundos)</label>
+                    <input id="lengthSlider" type="range" min="2" max="10" step="0.5" value="6" style="width:70%;">
+                    <span id="lengthDisplay" style="color:var(--accent); font-weight:bold; margin-left:8px;">6.0s</span>
+                    <input type="hidden" id="length" value="150">
+                    <div style="font-size:0.75rem; color:var(--muted); margin-top:2px;">~<span id="framesDisplay">150</span> frames @ 25fps</div>
+                </div>
+                <div>
+                    <label for="seed">Seed (-1 = aleatorio)</label>
+                    <input id="seed" type="number" value="-1">
+                </div>
+                <div>
+                    <label for="steps">Steps</label>
+                    <input id="steps" type="number" min="1" max="100" value="50">
+                </div>
+                <div>
+                    <label for="cfg">CFG Scale</label>
+                    <input id="cfg" type="number" min="1" max="30" step="0.5" value="3">
+                </div>
+
+                <div class="full">
+                    <button class="generate" id="btn">Gerar Video</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="result" id="result">
+            <div class="card">
+                <h3 style="margin-bottom: 12px;">Resultado</h3>
+                <div id="videoContainer"></div>
+                <div id="log" class="log"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const btn = document.getElementById('btn');
+        const btnLoad = document.getElementById('btnLoadImages');
+        const result = document.getElementById('result');
+        const videoContainer = document.getElementById('videoContainer');
+        const logDiv = document.getElementById('log');
+        const imageList = document.getElementById('imageList');
+        const imgCount = document.getElementById('imgCount');
+        const selectedPath = document.getElementById('selectedImagePath');
+        const previewDiv = document.getElementById('selectedImagePreview');
+        const imgPrompt = document.getElementById('imgPrompt');
+        const chkTranslate = document.getElementById('chkTranslate');
+        const videoPreview = document.getElementById('videoPromptPreview');
+        const chkManual = document.getElementById('chkManualVideo');
+        const manualPromptBox = document.getElementById('videoPromptManual');
+
+        const API_BASE = '';
+
+        function log(msg, cls = 'ok') {
+            const span = document.createElement('span');
+            span.textContent = msg + '\n';
+            span.className = cls;
+            logDiv.appendChild(span);
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        // Tradução client-side (mirror do Python)
+        const STATIC_TERMS = [
+            /\\d+mm lens/gi, /medium shot/gi, /close[\\s-]?up/gi, /wide shot/gi,
+            /full shot/gi, /extreme close[\\s-]?up/gi, /shallow depth of field/gi,
+            /depth of field/gi, /sharp focus on/gi, /focus on/gi,
+            /National Geographic/gi, /nature photography/gi, /photography/gi,
+            /natural colors/gi, /detailed textures/gi, /textures of/gi,
+            /raw photo/gi, /8k/gi
+        ];
+        const MOTION_SUFFIX = ", consistent scene, stable composition, camera slowly pans to the right, subtle ambient motion only, fixed viewpoint, seamless cyclic motion, smooth continuous movement, infinite loop feel, ambient perpetual motion, natural repeating rhythm, hypnotic gentle flow, meditative calm motion";
+
+        function translatePrompt(text) {
+            let out = text;
+            STATIC_TERMS.forEach(p => { out = out.replace(p, ''); });
+            out = out.replace(/,\\s*,/g, ',').replace(/\\s+/g, ' ').trim(', ');
+            return out + MOTION_SUFFIX;
+        }
+
+        function updateVideoPreview() {
+            if (!chkTranslate.checked) {
+                videoPreview.textContent = "(Traducao desativada - usara prompt de imagem diretamente)";
+                return;
+            }
+            const t = translatePrompt(imgPrompt.value);
+            videoPreview.textContent = t;
+        }
+
+        imgPrompt.addEventListener('input', updateVideoPreview);
+        chkTranslate.addEventListener('change', updateVideoPreview);
+        chkManual.addEventListener('change', () => {
+            manualPromptBox.style.display = chkManual.checked ? 'block' : 'none';
+            if (chkManual.checked) {
+                videoPreview.textContent = "(Usando prompt manual de video)";
+            } else {
+                updateVideoPreview();
+            }
+        });
+        updateVideoPreview();
+
+        const lengthSlider = document.getElementById('lengthSlider');
+        const lengthDisplay = document.getElementById('lengthDisplay');
+        const lengthInput = document.getElementById('length');
+        const framesDisplay = document.getElementById('framesDisplay');
+
+        function updateLength() {
+            const seconds = parseFloat(lengthSlider.value);
+            const frames = Math.round(seconds * 25); // 25 fps
+            lengthDisplay.textContent = seconds.toFixed(1) + 's';
+            lengthInput.value = frames;
+            framesDisplay.textContent = frames;
+        }
+        lengthSlider.addEventListener('input', updateLength);
+        updateLength();
+
+        // Carregar imagens do ComfyUI output
+        async function loadImages() {
+            log('[INFO] A carregar imagens do output do ComfyUI...', 'info');
+            try {
+                const res = await fetch(API_BASE + '/images');
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const data = await res.json();
+                imageList.innerHTML = '';
+                imgCount.textContent = data.length + ' imagens';
+
+                if (data.length === 0) {
+                    imageList.innerHTML = '<div style="color:var(--muted); padding:10px;">Nenhuma imagem encontrada no output do ComfyUI</div>';
+                    return;
+                }
+
+                data.forEach(img => {
+                    const div = document.createElement('div');
+                    div.className = 'image-item';
+                    div.innerHTML = `<img src="${API_BASE}/image/${encodeURIComponent(img.filename)}" alt="" onerror="this.style.display='none'"><span>${img.filename}</span>`;
+                    div.onclick = () => {
+                        document.querySelectorAll('.image-item').forEach(el => el.classList.remove('selected'));
+                        div.classList.add('selected');
+                        selectedPath.value = img.path;
+                        previewDiv.innerHTML = `<img src="${API_BASE}/image/${encodeURIComponent(img.filename)}" class="preview-img" alt="Preview">`;
+                        log(`[OK] Imagem selecionada: ${img.filename}`);
+                    };
+                    imageList.appendChild(div);
+                });
+                log(`[OK] ${data.length} imagens carregadas`, 'ok');
+            } catch (err) {
+                log('[ERRO] ' + err.message, 'error');
+                imageList.innerHTML = '<div style="color:#ff5555; padding:10px;">Erro ao carregar imagens. Verifica se o servidor esta a correr.</div>';
+            }
+        }
+
+        btnLoad.addEventListener('click', loadImages);
+        loadImages();
+
+        btn.addEventListener('click', async () => {
+            if (!selectedPath.value) {
+                log('[ERRO] Seleciona uma imagem primeiro!', 'error');
+                return;
+            }
+
+            btn.disabled = true;
+            btn.textContent = 'A gerar...';
+            result.classList.remove('active');
+            videoContainer.innerHTML = '';
+            logDiv.innerHTML = '';
+            result.classList.add('active');
+
+            const payload = {
+                image: selectedPath.value,
+                prompt: imgPrompt.value,
+                negative: document.getElementById('negative').value,
+                strength: parseFloat(document.getElementById('strength').value),
+                length: parseInt(document.getElementById('length').value),
+                seed: parseInt(document.getElementById('seed').value),
+                steps: parseInt(document.getElementById('steps').value),
+                cfg: parseFloat(document.getElementById('cfg').value)
+            };
+
+            if (chkManual.checked && manualPromptBox.value.trim()) {
+                payload.video_prompt = manualPromptBox.value.trim();
+            } else if (!chkTranslate.checked) {
+                payload.no_translate = true;
+            }
+
+            log('[INFO] A enviar pedido para gerar video...');
+            log(`[INFO] Imagem: ${selectedPath.value.split('/').pop()}`);
+            log(`[INFO] Strength: ${payload.strength} | Frames: ${payload.length} | Seed: ${payload.seed}`);
+
+            try {
+                const res = await fetch(API_BASE + '/generate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!res.ok) {
+                    const text = await res.text();
+                    throw new Error('HTTP ' + res.status + ': ' + text.substring(0, 200));
+                }
+
+                const data = await res.json();
+
+                if (data.status === 'success') {
+                    log('[OK] Video gerado com sucesso!', 'ok');
+                    log('Prompt ID: ' + data.prompt_id);
+
+                    if (data.videos && data.videos.length > 0) {
+                        data.videos.forEach(v => {
+                            const card = document.createElement('div');
+                            card.style.cssText = 'background:var(--card); border:1px solid var(--border); border-radius:10px; padding:10px; margin-bottom:10px;';
+
+                            const vid = document.createElement('video');
+                            vid.src = API_BASE + '/video/' + encodeURIComponent(v.filename);
+                            vid.controls = true;
+                            vid.playsInline = true;
+
+                            const info = document.createElement('div');
+                            info.style.cssText = 'padding:8px; font-size:0.8rem; color:var(--muted); word-break:break-all;';
+                            info.textContent = v.filename;
+
+                            card.appendChild(vid);
+                            card.appendChild(info);
+                            videoContainer.appendChild(card);
+                        });
+                    } else {
+                        log('[AVISO] Nenhum video retornado na resposta. Verifica o output do ComfyUI.', 'warn');
+                    }
+                } else {
+                    log('[ERRO] ' + (data.message || 'Erro desconhecido'), 'error');
+                    if (data.stdout) log('[DEBUG] stdout: ' + data.stdout, 'warn');
+                }
+            } catch (err) {
+                log('[ERRO] ' + err.message, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Gerar Video';
+            }
+        });
+    </script>
+</body>
+</html>
