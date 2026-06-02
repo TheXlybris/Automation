@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="pt-PT">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gerador de Imagens - Hermes</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 20px auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #2c3e50;
+            text-align: center;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input, select, textarea {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        button {
+            background-color: #3498db;
+            color: white;
+            padding: 10px 15px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            width: 100%;
+        }
+        button:hover {
+            background-color: #2980b9;
+        }
+        .result {
+            margin-top: 20px;
+            padding: 15px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            background-color: #f9f9f9;
+        }
+        .error {
+            color: #e74c3c;
+        }
+        .success {
+            color: #27ae60;
+        }
+        .hidden {
+            display: none;
+        }
+        .advanced-options {
+            margin-top: 15px;
+            padding: 15px;
+            background-color: #f9f9f9;
+            border-radius: 4px;
+            border: 1px solid #ddd;
+        }
+        .toggle-advanced {
+            background-color: #95a5a6;
+            color: white;
+            padding: 5px 10px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            margin-bottom: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🪄 Gerador de Imagens - Hermes</h1>
+        <p>Crie imagens automaticamente usando o ComfyUI sem precisar acessá-lo diretamente.</p>
+        
+        <form id="imageForm">
+            <div class="form-group">
+                <label for="prompt">Prompt da Imagem:</label>
+                <textarea id="prompt" rows="4" placeholder="Ex: Um gato dormindo numa lua cheia" required></textarea>
+            </div>
+            
+            <div class="form-group">
+                <label for="size">Tamanho da Imagem:</label>
+                <select id="size" required>
+                    <option value="1024x576">1024 x 576 (16:9)</option>
+                    <option value="2048x1152">2048 x 1152 (16:9)</option>
+                </select>
+            </div>
+            
+            <div class="form-group">
+                <label for="batchSize">Número de Imagens:</label>
+                <select id="batchSize" required>
+                    <option value="1">1</option>
+                    <option value="2">2</option>
+                    <option value="3">3</option>
+                    <option value="4">4</option>
+                    <option value="5">5</option>
+                    <option value="6">6</option>
+                    <option value="7">7</option>
+                    <option value="8">8</option>
+                </select>
+            </div>
+            
+            <button type="button" class="toggle-advanced" onclick="toggleAdvanced()">▼ Opções Avançadas</button>
+            
+            <div id="advancedOptions" class="advanced-options hidden">
+                <div class="form-group">
+                    <label for="seed">Seed (deixe -1 para aleatório):</label>
+                    <input type="number" id="seed" value="-1" min="-1" step="1">
+                </div>
+                <div class="form-group">
+                    <label for="steps">Passos (recomendado 70):</label>
+                    <input type="number" id="steps" value="70" min="1" max="200" step="1">
+                </div>
+                <div class="form-group">
+                    <label for="cfg">CFG Scale (recomendado 8):</label>
+                    <input type="number" id="cfg" value="8" min="1" max="30" step="0.1">
+                </div>
+            </div>
+            
+            <div class="form-group">
+                <button type="button" onclick="generateImage()">🚀 Gerar Imagem</button>
+            </div>
+        </form>
+        
+        <div id="result" class="result hidden">
+            <h3>Resultado:</h3>
+            <div id="status"></div>
+            <div id="outputFiles"></div>
+        </div>
+    </div>
+    
+    <script>
+        function toggleAdvanced() {
+            const advancedDiv = document.getElementById('advancedOptions');
+            const button = document.querySelector('.toggle-advanced');
+            
+            if (advancedDiv.classList.contains('hidden')) {
+                advancedDiv.classList.remove('hidden');
+                button.textContent = '▲ Opções Avançadas';
+            } else {
+                advancedDiv.classList.add('hidden');
+                button.textContent = '▼ Opções Avançadas';
+            }
+        }
+        
+        async function generateImage() {
+            // Obter valores do formulário
+            const prompt = document.getElementById('prompt').value.trim();
+            const size = document.getElementById('size').value;
+            const batchSize = parseInt(document.getElementById('batchSize').value);
+            const seed = parseInt(document.getElementById('seed').value);
+            const steps = parseInt(document.getElementById('steps').value);
+            const cfg = parseFloat(document.getElementById('cfg').value);
+            
+            // Validar prompt
+            if (!prompt) {
+                showResult('Por favor, insira um prompt.', 'error');
+                return;
+            }
+            
+            // Mostrar carregando
+            showResult('Gerando imagem... Por favor, aguarde.', 'info');
+            
+            try {
+                // Criar dados para envio
+                const formData = new FormData();
+                formData.append('prompt', prompt);
+                formData.append('width', size.split('x')[0]);
+                formData.append('height', size.split('x')[1]);
+                formData.append('batch_size', batchSize);
+                formData.append('seed', seed);
+                formData.append('steps', steps);
+                formData.append('cfg', cfg);
+                
+                // Enviar para o script Python via fetch (precisa de backend)
+                // Para demonstração, vamos simular a resposta
+                
+                // Em um ambiente real, você precisaria de um servidor backend
+                // para executar o script Python e retornar os resultados
+                
+                // Simulação de resposta para fins de demonstração
+                setTimeout(() => {
+                    const mockResponse = {
+                        status: "success",
+                        files: [
+                            "/mnt/d/AI_Ecosystem/04_Data/Hermes/images/hermes_20260507_182315_001.png",
+                            "/mnt/d/AI_Ecosystem/04_Data/Hermes/images/hermes_20260507_182315_002.png"
+                        ]
+                    };
+                    
+                    if (mockResponse.status === "success") {
+                        let fileLinks = '';
+                        mockResponse.files.forEach(file => {
+                            fileLinks += `<p>📍 <a href="${file}" target="_blank">${file}</a></p>`;
+                        });
+                        showResult(`✅ Geração concluída com sucesso!`, 'success');
+                        document.getElementById('outputFiles').innerHTML = fileLinks;
+                    } else {
+                        showResult(`❌ Erro: ${mockResponse.message}`, 'error');
+                    }
+                }, 2000);
+                
+            } catch (error) {
+                showResult(`❌ Erro inesperado: ${error.message}`, 'error');
+            }
+        }
+        
+        function showResult(message, type) {
+            const resultDiv = document.getElementById('result');
+            const statusDiv = document.getElementById('status');
+            
+            resultDiv.classList.remove('hidden');
+            statusDiv.className = type;
+            statusDiv.textContent = message;
+            
+            if (type === 'error') {
+                console.error(message);
+            } else if (type === 'success') {
+                console.log(message);
+            }
+        }
+    </script>
+</body>
+</html>
