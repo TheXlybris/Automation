@@ -1,0 +1,82 @@
+[
+  {
+    "name": "Rain & Thunder",
+    "tags": "ambient instrumental, soft atmospheric pads, gentle rain on leaves, distant low thunder rumble, subtle ocean waves lapping shore, wind rustling through pine trees, nature soundscape, no vocals, no lyrics, relaxing meditation music, seamless loop, slow tempo, 60 BPM",
+    "lyrics": "[instrumental]",
+    "bpm": 60,
+    "duration": 110,
+    "keyscale": "A minor",
+    "cfg_scale": 2.0,
+    "temperature": 0.85
+  },
+  {
+    "name": "Ocean Waves",
+    "tags": "ambient instrumental, ocean waves crashing on shore, soft sea breeze, distant seagulls, coastal atmosphere, crystalline synth pads, no vocals, no lyrics, relaxing meditation music, seamless loop, slow tempo, 55 BPM",
+    "lyrics": "[instrumental]",
+    "bpm": 55,
+    "duration": 110,
+    "keyscale": "E major",
+    "cfg_scale": 2.0,
+    "temperature": 0.85
+  },
+  {
+    "name": "Forest Wind",
+    "tags": "ambient instrumental, wind rustling through pine trees, forest ambience, distant birdsong, soft mossy undergrowth, morning dew atmosphere, no vocals, no lyrics, relaxing meditation music, seamless loop, slow tempo, 50 BPM",
+    "lyrics": "[instrumental]",
+    "bpm": 50,
+    "duration": 110,
+    "keyscale": "C major",
+    "cfg_scale": 2.0,
+    "temperature": 0.85
+  },
+  {
+    "name": "Night Stars",
+    "tags": "ambient instrumental, deep space pads, starry night atmosphere, vast cosmos, soft synth drones, distant galaxy, peaceful sleep music, no vocals, no lyrics, seamless loop, very slow tempo, 45 BPM",
+    "lyrics": "[instrumental]",
+    "bpm": 45,
+    "duration": 110,
+    "keyscale": "D minor",
+    "cfg_scale": 2.0,
+    "temperature": 0.85
+  },
+  {
+    "name": "Heavy Rain Storm",
+    "tags": "ambient instrumental, heavy rain on rooftop, rolling thunderstorm, wind howling through trees, deep sub bass drone, atmospheric fog, no vocals, no lyrics, intense rain ambience, seamless loop, 55 BPM",
+    "lyrics": "[instrumental]",
+    "bpm": 55,
+    "duration": 110,
+    "keyscale": "G minor",
+    "cfg_scale": 2.0,
+    "temperature": 0.80
+  },
+  {
+    "name": "Soft Morning",
+    "tags": "ambient instrumental, soft morning light, gentle birdsong, calm water ripples, warm analog synth pads, peaceful awakening, no vocals, no lyrics, gentle meditation music, seamless loop, 65 BPM",
+    "lyrics": "[instrumental]",
+    "bpm": 65,
+    "duration": 110,
+    "keyscale": "F major",
+    "cfg_scale": 2.0,
+    "temperature": 0.85
+  },
+  {
+    "name": "Fireplace Crackle",
+    "tags": "ambient instrumental, warm fireplace crackle, cozy cabin atmosphere, soft wooden creaks, warm amber light feeling, no vocals, no lyrics, relaxing sleep music, seamless loop, slow tempo, 50 BPM",
+    "lyrics": "[instrumental]",
+    "bpm": 50,
+    "duration": 110,
+    "keyscale": "C major",
+    "cfg_scale": 2.0,
+    "temperature": 0.85
+  },
+  {
+    "name": "Snowy Mountains",
+    "tags": "ambient instrumental, cold mountain wind, snow crunching underfoot, vast alpine silence, crystalline ice textures, no vocals, no lyrics, arctic meditation music, seamless loop, very slow tempo, 40 BPM",
+    "lyrics": "[instrumental]",
+    "bpm": 40,
+    "duration": 110,
+    "keyscale": "A minor",
+    "cfg_scale": 2.0,
+    "temperature": 0.75
+  }
+]
