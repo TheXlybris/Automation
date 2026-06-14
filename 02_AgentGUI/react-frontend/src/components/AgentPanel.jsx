@@ -57,8 +57,8 @@ export default function AgentPanel({ socket }) {
           </h2>
           <button
             onClick={() => setFocused(null)}
-            className="btn btn-sm text-xs px-3 py-1.5"
-            style={{ background:'var(--bg-hover)', borderColor:'var(--border-subtle)' }}
+            className="btn-glow px-4 py-2 rounded-lg text-xs font-mono border"
+            style={{ background:'var(--bg-hover)', borderColor:'var(--border-subtle)', color: 'var(--text-secondary)' }}
           >
             ← Retroceder
           </button>
@@ -102,14 +102,21 @@ export default function AgentPanel({ socket }) {
             <button
               onClick={() => dispatchTask(ag.id)}
               disabled={!(tasks[ag.id] || '').trim()}
-              className="btn btn-primary flex-1 text-[11px] py-2"
+              className="btn-glow flex-1 text-[11px] py-2 px-4 rounded-lg font-mono font-bold border"
+              style={{
+                background: !(tasks[ag.id] || '').trim() ? 'var(--bg-secondary)' : 'var(--bg-card)',
+                borderColor: !(tasks[ag.id] || '').trim() ? 'var(--border-subtle)' : 'var(--matrix-green)',
+                color: !(tasks[ag.id] || '').trim() ? 'var(--text-muted)' : 'var(--matrix-green)',
+                cursor: !(tasks[ag.id] || '').trim() ? 'not-allowed' : 'pointer',
+                opacity: !(tasks[ag.id] || '').trim() ? 0.5 : 1,
+              }}
             >
-              {dispatched===ag.id ? 'Dispatched!' : 'Dispatch'}
+              {dispatched===ag.id ? '✓ Dispatched!' : 'Dispatch'}
             </button>
             <button
               onClick={() => setFocused(null)}
-              className="btn btn-sm text-xs px-4"
-              style={{ background:'var(--bg-hover)', borderColor:'var(--border-subtle)' }}
+              className="btn-glow px-4 py-2 rounded-lg text-xs font-mono border"
+              style={{ background:'var(--bg-hover)', borderColor:'var(--border-subtle)', color: 'var(--text-secondary)' }}
             >
               ←
             </button>
@@ -129,7 +136,17 @@ export default function AgentPanel({ socket }) {
         <h2 className="text-sm font-mono uppercase tracking-wider" style={{ color:'var(--cyber-blue)' }}>
           Agent Profiles
         </h2>
-        <button onClick={addCard} className="btn btn-primary btn-sm text-xs">+ New Card</button>
+        <button 
+          onClick={addCard} 
+          className="btn-glow px-3 py-1.5 rounded-lg text-xs font-mono border"
+          style={{ 
+            background: 'var(--bg-card)', 
+            borderColor: 'var(--border-active)', 
+            color: 'var(--cyber-blue)',
+          }}
+        >
+          + New Card
+        </button>
       </div>
 
       <div className="grid grid-cols-2 xl:grid-cols-4 gap-3">

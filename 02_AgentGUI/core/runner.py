@@ -41,8 +41,10 @@ def launch_agent(profile: str, goal: str, prompt: str, agent_id: str = None, tim
     # Build the command to run inside tmux
     runner_script = Path(__file__).parent.parent / "profiles" / f"run_{profile}.py"
 
+    project_dir = Path(__file__).parent.parent
+
     if runner_script.exists():
-        cmd = f"cd {Path(__file__).parent.parent} && python3 {runner_script} {agent_id}"
+        cmd = f"export AGENTUI_DIR={project_dir} && cd {project_dir} && python3 {runner_script} {agent_id}"
     else:
         # Fallback: run hermes chat with prompt
         log_file = Path(__file__).parent.parent / 'data' / f'{agent_id}.log'

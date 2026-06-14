@@ -13,7 +13,7 @@ const DEFAULT_HISTORY = [
   { id:'3', profile:'researcher', task:'Find best LoRA for SDXL fantasy style',        status:'completed', time:'2026-06-11 13:45' },
 ];
 
-export default function AgentHistory({ socket }) {
+export default function AgentHistory({ socket, compact = false }) {
   const [open, setOpen] = useState(false);
   const [history, setHistory] = useState(DEFAULT_HISTORY);
 
@@ -56,29 +56,59 @@ export default function AgentHistory({ socket }) {
     };
   }, [socket]);
 
+  const runningCount = history.filter(h => h.status === 'running').length;
+
   return (
-    <div className="history-sidebar">
+    <div className="relative">
+      {/* Toggle button */}
       <button
         onClick={() => setOpen(!open)}
-        className="history-toggle"
-        title={open ? 'Ocultar histórico' : 'Ver histórico de tarefas'}
+        className={`w-full flex items-center gap-3 px-3 py-3 rounded-lg transition-all duration-200 text-left ${
+          open
+            ? 'bg-[var(--bg-card)] text-[var(--amber-warn)] border border-[var(--border-active)]'
+            : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
+        }`}
+        title="Historico de Tarefas"
       >
-        <span className="text-sm">{open ? '✕' : '☰'}</span>
-        <span className="text-[10px] font-mono">{open ? 'FECHAR' : 'HISTÓRICO'}</span>
+        <span className="text-xl flex-shrink-0 w-6 text-center relative">
+          {'\u25A0'}
+          {runningCount > 0 && (
+            <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-[var(--matrix-green)] animate-pulse" />
+          )}
+        </span>
+        {!compact && (
+          <span className="text-[11px] font-mono font-bold tracking-wider whitespace-nowrap">
+            HISTORICO
+          </span>
+        )}
       </button>
 
+      {/* History panel */}
       {open && (
-        <div className="history-panel">
-          <div className="history-header">
-            <h3 className="text-xs font-mono uppercase tracking-wider" style={{ color:'var(--cyber-blue)' }}>
-              Histórico de Tarefas
+        <div
+          className={`absolute z-50 bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl shadow-2xl overflow-hidden ${
+            compact ? 'left-14 bottom-0 w-72 max-h-[500px]' : 'left-0 bottom-12 w-72 max-h-[500px]'
+          }`}
+          style={{ boxShadow: '0 0 40px rgba(0,0,0,0.6)' }}
+        >
+          <div className="p-3 border-b border-[var(--border-subtle)] flex items-center justify-between">
+            <h3 className="text-[11px] font-mono font-bold tracking-wider text-[var(--cyber-blue)] uppercase">
+              Historico
             </h3>
-            <span className="text-[10px] text-[var(--text-dim)]">
-              {history.filter(h=>h.status==='running').length} a correr
-            </span>
+            <div className="flex items-center gap-2">
+              <span className="text-[9px] font-mono text-[var(--text-dim)]">
+                {runningCount} a correr
+              </span>
+              <button
+                onClick={() => setOpen(false)}
+                className="text-[var(--text-muted)] hover:text-[var(--text-primary)] text-xs px-1"
+              >
+                {'\u2715'}
+              </button>
+            </div>
           </div>
 
-          <div className="history-list">
+          <div className="overflow-y-auto p-2 flex flex-col gap-2 max-h-[440px]">
             {history.length === 0 && (
               <div className="text-center text-[var(--text-dim)] text-[10px] py-8">
                 Sem tarefas registadas.
@@ -93,15 +123,15 @@ export default function AgentHistory({ socket }) {
               return (
                 <div
                   key={h.id}
-                  className="history-item"
+                  className="rounded-lg p-2.5 transition-colors hover:bg-[rgba(255,255,255,0.03)]"
                   style={{
-                    borderLeftColor: meta.color,
+                    borderLeft: `2px solid ${meta.color}`,
                     background: meta.bg,
                   }}
                 >
                   <div className="flex items-center justify-between mb-1">
                     <span
-                      className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded"
+                      className="text-[9px] font-mono font-bold px-1.5 py-0.5 rounded"
                       style={{
                         color: meta.color,
                         border: `1px solid ${meta.border}`,
@@ -118,7 +148,7 @@ export default function AgentHistory({ socket }) {
                     {h.task}
                   </div>
                   <div className="flex items-center gap-1">
-                    <span className="w-1 h-1 rounded-full animate-pulse"
+                    <span className="w-1.5 h-1.5 rounded-full animate-pulse"
                       style={{ background: statusColor }}
                     />
                     <span className="text-[9px] font-mono uppercase" style={{ color: statusColor }}>

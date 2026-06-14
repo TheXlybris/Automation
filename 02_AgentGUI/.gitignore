@@ -1,0 +1,38 @@
+# Virtual environments
+venv/
+env/
+ENV/
+node_modules/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Runtime state & logs
+*.log
+data/
+*_history.json
+*_inbox.json
+*_state.json
+*_summary.json
+*_mode.json
+
+# Secrets
+.env
+.env.local
+*.key
+id_rsa*
+
+# Build artifacts (recreatable from react-frontend/)
+# Nota: static/ é INCLUIDO no repo para deploy-without-build
+# static/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AgentGUI -- Painel de Agentes</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header>
+        <h1>AgentGUI</h1>
+        <p>Painel de controlo de agentes paralelos</p>
+    </header>
+
+    <main>
+        <!-- Launch Panel -->
+        <section class="launch-panel">
+            <h2>Lancar Novo Agente</h2>
+            <div class="form-row">
+                <label for="profile">Perfil:</label>
+                <select id="profile">
+                    <option value="researcher">Researcher (Pesquisa)</option>
+                    <option value="developer">Developer (Codigo)</option>
+                    <option value="multimedia">Multimedia (Imagem/Video/Audio)</option>
+                </select>
+            </div>
+            <div class="form-row">
+                <label for="goal">Tarefa / Objetivo:</label>
+                <textarea id="goal" rows="3" placeholder="Descreve o que o agente deve fazer..."></textarea>
+            </div>
+            <div class="form-row">
+                <label for="prompt">Prompt completo (opcional):</label>
+                <textarea id="prompt" rows="4" placeholder="Se vazio, usa o goal como prompt..."></textarea>
+            </div>
+            <button id="btn-launch" class="btn-primary">Lancar Agente</button>
+            <div id="launch-status" class="status-msg"></div>
+        </section>
+
+        <!-- Active Agents -->
+        <section class="agents-panel">
+            <h2>Agentes Ativos</h2>
+            <div class="filters">
+                <button class="filter-btn active" data-filter="all">Todos</button>
+                <button class="filter-btn" data-filter="running">A correr</button>
+                <button class="filter-btn" data-filter="completed">Concluidos</button>
+                <button class="filter-btn" data-filter="error">Erros</button>
+            </div>
+            <div id="agents-table-container">
+                <table id="agents-table">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Perfil</th>
+                            <th>Status</th>
+                            <th>Progresso</th>
+                            <th>Mensagem</th>
+                            <th>Tempo</th>
+                            <th>Acoes</th>
+                        </tr>
+                    </thead>
+                    <tbody id="agents-tbody">
+                        <tr class="empty-row">
+                            <td colspan="7">Nenhum agente ativo. Lanca um acima.</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- Output Viewer Modal -->
+        <div id="output-modal" class="modal hidden">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>Output: <span id="modal-agent-id"></span></h3>
+                    <button id="btn-close-modal" class="btn-icon">&times;</button>
+                </div>
+                <pre id="modal-output"></pre>
+            </div>
+        </div>
+    </main>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

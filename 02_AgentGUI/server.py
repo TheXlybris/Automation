@@ -174,12 +174,49 @@ def handle_refresh():
 
 @socketio.on('dispatch_task')
 def handle_dispatch_task(data):
-    """Receives task dispatch from AgentPanel and stores it."""
+    """Receives task dispatch from AgentPanel and launches the agent."""
     profile = data.get('target_profile', 'unknown')
     task = data.get('task', '')
+
+    # Map frontend agent IDs to profile names
+    profile_map = {
+        'dev': 'developer',
+        'mm': 'multimedia',
+        'res': 'researcher',
+        'wiki': 'wiki'
+    }
+    if profile in profile_map:
+        profile = profile_map[profile]
+
+    valid_profiles = ['researcher', 'developer', 'multimedia', 'wiki']
+    if profile not in valid_profiles:
+        emit('error', {'message': f'Invalid profile. Use: {valid_profiles}'})
+        return
+
+    if not task or not task.strip():
+        emit('error', {'message': 'Task description cannot be empty'})
+        return
+
     timestamp = datetime.now().isoformat()
+    agent_id = f"{profile}_{uuid.uuid4().hex[:8]}"
+
+    # Create task file
+    task_file = Path(__file__).parent / "data" / f"{agent_id}_task.json"
+    task_file.parent.mkdir(parents=True, exist_ok=True)
+    task_data = {
+        "id": agent_id, "profile": profile, "goal": task,
+        "prompt": task, "context": data.get('context', ''),
+        "timeout_seconds": data.get('timeout_seconds', 1200)
+    }
+    with open(task_file, 'w', encoding='utf-8') as f:
+        json.dump(task_data, f, indent=2)
+
+    # Register and launch via tmux
+    register_agent(agent_id, profile, task, f"python3 profiles/run_{profile}.py {agent_id}")
+    agent = launch_agent(profile, task, task, agent_id=agent_id)
+
     entry = {
-        'id': f"{profile}_{uuid.uuid4().hex[:8]}",
+        'id': agent_id,
         'profile': profile,
         'task': task,
         'status': 'running',
@@ -411,6 +448,219 @@ orchestrator_state = {
     'processing': False
 }
 
+# ─── Cron Tasks ────────────────────────────────────
+CRON_FILE = Path(__file__).parent / "data" / "cron_tasks.json"
+CRON_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+def load_cron_tasks() -> list:
+    if not CRON_FILE.exists():
+        return []
+    try:
+        with open(CRON_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_cron_tasks(tasks: list):
+    with open(CRON_FILE, 'w', encoding='utf-8') as f:
+        json.dump(tasks, f, indent=2, ensure_ascii=False)
+
+@socketio.on('add_cron_task')
+def handle_add_cron_task(data):
+    """Add a new scheduled cron task."""
+    profile = data.get('profile', 'researcher')
+    valid_profiles = ['researcher', 'developer', 'multimedia', 'wiki']
+    if profile not in valid_profiles:
+        emit('error', {'message': f'Invalid profile. Use: {valid_profiles}'})
+        return
+
+    task_text = (data.get('task', '') or '').strip()
+    if not task_text:
+        emit('error', {'message': 'Task description cannot be empty'})
+        return
+
+    hour = data.get('hour', 0)
+    minute = data.get('minute', 0)
+    days = data.get('days', [])  # [0,1,2,3,4,5,6] where 0=Monday
+    repeat_type = data.get('repeat_type', 'times')  # 'times' | 'infinite'
+    repeat_count = data.get('repeat_count', 1)
+
+    entry = {
+        'id': str(uuid.uuid4())[:12],
+        'profile': profile,
+        'task': task_text,
+        'hour': hour,
+        'minute': minute,
+        'days': days,
+        'repeat_type': repeat_type,
+        'repeat_count': repeat_count,
+        'runs_done': 0,
+        'enabled': True,
+        'created_at': datetime.now().isoformat()
+    }
+    tasks = load_cron_tasks()
+    tasks.append(entry)
+    save_cron_tasks(tasks)
+    emit('cron_task_added', entry)
+    socketio.emit('cron_tasks_update', {'tasks': tasks})
+
+@socketio.on('remove_cron_task')
+def handle_remove_cron_task(data):
+    task_id = data.get('id', '')
+    tasks = load_cron_tasks()
+    tasks = [t for t in tasks if t['id'] != task_id]
+    save_cron_tasks(tasks)
+    emit('cron_task_removed', {'id': task_id})
+    socketio.emit('cron_tasks_update', {'tasks': tasks})
+
+@socketio.on('toggle_cron_task')
+def handle_toggle_cron_task(data):
+    task_id = data.get('id', '')
+    enabled = data.get('enabled', True)
+    tasks = load_cron_tasks()
+    for t in tasks:
+        if t['id'] == task_id:
+            t['enabled'] = enabled
+            break
+    save_cron_tasks(tasks)
+    emit('cron_task_toggled', {'id': task_id, 'enabled': enabled})
+    socketio.emit('cron_tasks_update', {'tasks': tasks})
+
+@socketio.on('list_cron_tasks')
+def handle_list_cron_tasks():
+    emit('cron_tasks_update', {'tasks': load_cron_tasks()})
+
+@app.route("/api/cron/tasks", methods=["GET", "POST"])
+def api_cron_tasks():
+    if request.method == "POST":
+        data = request.json or {}
+        profile = data.get('profile', 'researcher')
+        task_text = (data.get('task', '') or '').strip()
+        if not task_text:
+            return jsonify({"error": "Task description cannot be empty"}), 400
+        entry = {
+            'id': str(uuid.uuid4())[:12],
+            'profile': profile,
+            'task': task_text,
+            'hour': data.get('hour', 0),
+            'minute': data.get('minute', 0),
+            'days': data.get('days', []),
+            'repeat_type': data.get('repeat_type', 'times'),
+            'repeat_count': data.get('repeat_count', 1),
+            'runs_done': 0,
+            'enabled': True,
+            'created_at': datetime.now().isoformat()
+        }
+        tasks = load_cron_tasks()
+        tasks.append(entry)
+        save_cron_tasks(tasks)
+        return jsonify(entry)
+    return jsonify(load_cron_tasks())
+
+@app.route("/api/cron/tasks/<task_id>", methods=["DELETE", "PATCH"])
+def api_cron_task(task_id):
+    tasks = load_cron_tasks()
+    if request.method == "DELETE":
+        tasks = [t for t in tasks if t['id'] != task_id]
+        save_cron_tasks(tasks)
+        return jsonify({"success": True})
+    if request.method == "PATCH":
+        data = request.json or {}
+        for t in tasks:
+            if t['id'] == task_id:
+                if 'enabled' in data:
+                    t['enabled'] = data['enabled']
+                break
+        save_cron_tasks(tasks)
+        return jsonify(tasks)
+    return jsonify({"error": "Method not allowed"}), 405
+
+def should_run_now(task: dict) -> bool:
+    """Check if a cron task should execute right now."""
+    if not task.get('enabled', True):
+        return False
+    now = datetime.now()
+    if now.hour != task.get('hour', 0):
+        return False
+    if now.minute != task.get('minute', 0):
+        return False
+    days = task.get('days', [])
+    if days and now.weekday() not in days:
+        return False
+    repeat_type = task.get('repeat_type', 'times')
+    if repeat_type == 'times':
+        if task.get('runs_done', 0) >= task.get('repeat_count', 1):
+            return False
+    return True
+
+def cron_scheduler_worker():
+    """Run every 60 seconds and execute due cron tasks."""
+    last_minute = -1
+    while True:
+        time.sleep(30)
+        now = datetime.now()
+        current_minute = now.hour * 60 + now.minute
+        if current_minute == last_minute:
+            continue
+        last_minute = current_minute
+
+        tasks = load_cron_tasks()
+        ran_any = False
+        for task in tasks:
+            if should_run_now(task):
+                profile = task['profile']
+                task_text = task['task']
+                agent_id = f"{profile}_{uuid.uuid4().hex[:8]}"
+
+                task_file = Path(__file__).parent / "data" / f"{agent_id}_task.json"
+                task_file.parent.mkdir(parents=True, exist_ok=True)
+                task_data = {
+                    "id": agent_id, "profile": profile, "goal": task_text,
+                    "prompt": task_text, "context": "", "timeout_seconds": 1200
+                }
+                with open(task_file, 'w', encoding='utf-8') as f:
+                    json.dump(task_data, f, indent=2)
+
+                register_agent(agent_id, profile, task_text,
+                               f"python3 profiles/run_{profile}.py {agent_id}")
+                launch_agent(profile, task_text, task_text, agent_id=agent_id)
+
+                task['runs_done'] = task.get('runs_done', 0) + 1
+                if task.get('repeat_type') == 'times' and task['runs_done'] >= task.get('repeat_count', 1):
+                    task['enabled'] = False
+
+                # Add to history
+                history_file = Path(__file__).parent / "data" / "history.json"
+                history = []
+                if history_file.exists():
+                    try:
+                        with open(history_file, 'r', encoding='utf-8') as f:
+                            history = json.load(f)
+                    except Exception:
+                        history = []
+                history.insert(0, {
+                    'id': agent_id, 'profile': profile, 'task': task_text,
+                    'status': 'running', 'time': now.isoformat()
+                })
+                with open(history_file, 'w', encoding='utf-8') as f:
+                    json.dump(history, f, indent=2)
+
+                socketio.emit('cron_task_executed', {
+                    'cron_id': task['id'],
+                    'agent_id': agent_id,
+                    'profile': profile,
+                    'task': task_text
+                })
+                ran_any = True
+
+        if ran_any:
+            save_cron_tasks(tasks)
+            socketio.emit('cron_tasks_update', {'tasks': tasks})
+            broadcast_agents()
+
+cron_thread = threading.Thread(target=cron_scheduler_worker, daemon=True)
+cron_thread.start()
+
 # ─── Launch Orchestrator Agent subprocess ────────────
 _orchestrator_process = None
 
@@ -574,6 +824,20 @@ def receive_windows_resources():
         windows_resources = data
         return jsonify({"success": True, "message": "Windows resources received"})
     return jsonify({"error": "No data received"}), 400
+
+# ─── Server Restart ────────────────────────────────
+@app.route("/api/restart", methods=["POST"])
+def api_restart_server():
+    """Trigger server restart via restart_server.sh."""
+    def restart():
+        time.sleep(0.5)
+        script = Path(__file__).parent / "restart_server.sh"
+        if script.exists():
+            os.system(f"bash {script} &")
+        else:
+            os.system(f"fuser -k 5020/tcp 2>/dev/null; sleep 2; cd {Path(__file__).parent} && {sys.executable} server.py > /tmp/agentgui.log 2>&1 &")
+    threading.Thread(target=restart, daemon=True).start()
+    return jsonify({"success": True, "message": "Server restarting..."})
 
 # ─── Main ─────────────────────────────────────────
 if __name__ == "__main__":

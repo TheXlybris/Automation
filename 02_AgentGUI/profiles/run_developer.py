@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 
 AGENT_ID = sys.argv[1]
-BASE_DIR = Path(os.environ.get("AGENTUI_DIR", "/mnt/d/AI_Ecosystem/10_Projects/02_AgentGUI"))
+BASE_DIR = Path(os.environ.get("AGENTUI_DIR", "/media/sf_AI_Ecosystem/10_Projects/02_AgentGUI"))
 TASK_FILE = BASE_DIR / "data" / f"{AGENT_ID}_task.json"
 LOG_FILE = BASE_DIR / "data" / f"{AGENT_ID}.log"
 

@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 AGENT_ID = sys.argv[1]
-BASE_DIR = Path(os.environ.get("AGENTUI_DIR", "/mnt/d/AI_Ecosystem/10_Projects/02_AgentGUI"))
+BASE_DIR = Path(os.environ.get("AGENTUI_DIR", "/media/sf_AI_Ecosystem/10_Projects/02_AgentGUI"))
 TASK_FILE = BASE_DIR / "data" / f"{AGENT_ID}_task.json"
 LOG_FILE = BASE_DIR / "data" / f"{AGENT_ID}.log"
 PROGRESS_FILE = Path(f"/tmp/progress_{AGENT_ID}.json")
@@ -42,9 +42,9 @@ def run_with_progress(task: dict):
     seed = task.get("seed", -1)
     prefix = task.get("filename_prefix", "AGENTGUI")
 
-    workflow_path = task.get("workflow_path", "/mnt/d/AI_Ecosystem/03_Workflows/API/Text2Image.json")
-    comfyui_url = task.get("comfyui_url", "http://192.168.144.1:8188")
-    output_dir = task.get("output_dir", "/mnt/d/AI_Ecosystem/04_Data/Hermes/images/output")
+    workflow_path = task.get("workflow_path", "/media/sf_AI_Ecosystem/03_Workflows/API/Text2Image.json")
+    comfyui_url = task.get("comfyui_url", "http://127.0.0.1:8188")
+    output_dir = task.get("output_dir", "/media/sf_AI_Ecosystem/02_Engines/ComfyUI/ComfyUI/output")
 
     cmd = [
         sys.executable,

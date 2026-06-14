@@ -6,17 +6,19 @@ export default function OrchestratorChat({ socket }) {
   const [sending, setSending] = useState(false);
   const [mode, setMode] = useState('brainstorm');
   const [agentOnline, setAgentOnline] = useState(false);
+  const [isTyping, setIsTyping] = useState(false);
   const timeoutRef = useRef(null);
   const bottomRef = useRef(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [messages, isTyping]);
 
   useEffect(() => {
     if (!socket) return;
 
     const handleResponse = (data) => {
+      setIsTyping(false);
       setMessages(prev => [...prev, { role: 'assistant', text: data.text, mode: data.mode }]);
       setSending(false);
       setAgentOnline(true);
@@ -27,10 +29,7 @@ export default function OrchestratorChat({ socket }) {
     };
 
     const handleTyping = () => {
-      setMessages(prev => {
-        if (prev.length > 0 && prev[prev.length - 1].role === 'typing') return prev;
-        return [...prev, { role: 'typing', text: '' }];
-      });
+      setIsTyping(true);
       setAgentOnline(true);
     };
 
@@ -51,7 +50,6 @@ export default function OrchestratorChat({ socket }) {
     socket.on('orchestrator_status', handleStatus);
     socket.on('orchestrator_mode_change', handleModeChange);
 
-    // Polling HTTP do estado do orquestrador (fallback para Socket.IO)
     const pollStatus = async () => {
       try {
         const res = await fetch('http://192.168.0.188:5020/api/orchestrator/status');
@@ -62,9 +60,7 @@ export default function OrchestratorChat({ socket }) {
             if (data.mode) setMode(data.mode);
           }
         }
-      } catch (e) {
-        // Silencioso — pode estar offline
-      }
+      } catch (e) {}
     };
     pollStatus();
     const pollInterval = setInterval(pollStatus, 5000);
@@ -88,14 +84,15 @@ export default function OrchestratorChat({ socket }) {
     setMessages(prev => [...prev, { role: 'user', text: txt }]);
     setInput('');
     setSending(true);
-    // Timeout: se ninguém responder em 30s (o agente pode demorar), remover "a processar"
+    setIsTyping(true);
     if (timeoutRef.current) clearTimeout(timeoutRef.current);
     timeoutRef.current = setTimeout(() => {
       setSending(false);
-      setMessages(prev => {
-        const filtered = prev.filter(m => m.role !== 'typing');
-        return [...filtered, { role: 'system', text: 'Orquestrador não respondeu (offline ou ocupado). A resposta aparecerá aqui quando disponível.' }];
-      });
+      setIsTyping(false);
+      setMessages(prev => [
+        ...prev,
+        { role: 'system', text: 'Orquestrador nao respondeu (offline ou ocupado). A resposta aparecera aqui quando disponivel.' }
+      ]);
     }, 30000);
     socket.emit('orchestrator_message', { text: txt });
   };
@@ -151,43 +148,39 @@ export default function OrchestratorChat({ socket }) {
       </div>
 
       <div className="orchestrator-messages">
-        {messages.length === 0 && (
+        {messages.length === 0 && !isTyping && (
           <div className="text-xs text-[var(--text-muted)] font-mono py-8 text-center border border-dashed border-[var(--border-subtle)] rounded opacity-50">
             Chat vazio. Escreve abaixo para enviar uma mensagem ao orquestrador.
           </div>
         )}
         {messages.map((m, i) => (
           <div key={i} className={`msg msg-${m.role}`}>
-            {m.role === 'user' && (
-              <div className="msg-avatar user-avatar">Eu</div>
-            )}
-            {m.role === 'assistant' && (
-              <div className="msg-avatar assistant-avatar">H</div>
-            )}
-            {m.role === 'system' && (
-              <div className="msg-avatar system-avatar">✦</div>
-            )}
-            {m.role === 'typing' && (
-              <div className="msg-avatar assistant-avatar">H</div>
-            )}
+            {m.role === 'user' && <div className="msg-avatar user-avatar">Eu</div>}
+            {m.role === 'assistant' && <div className="msg-avatar assistant-avatar">H</div>}
+            {m.role === 'system' && <div className="msg-avatar system-avatar">✦</div>}
             <div className="msg-bubble">
-              {m.role === 'typing' ? (
-                <span className="typing-dots">
-                  <span></span><span></span><span></span>
+              <pre className="msg-text">{m.text}</pre>
+              {m.mode && (
+                <span className="text-[9px] font-mono opacity-40 mt-1 block" style={{ color: m.mode === 'orquestrator' ? 'var(--matrix-green)' : 'var(--cyber-blue)' }}>
+                  [{m.mode.toUpperCase()}]
                 </span>
-              ) : (
-                <>
-                  <pre className="msg-text">{m.text}</pre>
-                  {m.mode && (
-                    <span className="text-[9px] font-mono opacity-40 mt-1 block" style={{ color: m.mode === 'orchestrator' ? 'var(--matrix-green)' : 'var(--cyber-blue)' }}>
-                      [{m.mode.toUpperCase()}]
-                    </span>
-                  )}
-                </>
               )}
             </div>
           </div>
         ))}
+
+        {/* Typing indicator — SEPARATE from messages, shown below last message */}
+        {isTyping && (
+          <div className="msg msg-typing">
+            <div className="msg-avatar assistant-avatar">H</div>
+            <div className="msg-bubble">
+              <span className="typing-dots">
+                <span></span><span></span><span></span>
+              </span>
+            </div>
+          </div>
+        )}
+
         <div ref={bottomRef} />
       </div>
 
