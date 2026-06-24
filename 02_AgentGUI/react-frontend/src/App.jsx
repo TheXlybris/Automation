@@ -3,13 +3,46 @@ import { io } from 'socket.io-client';
 import SystemResources from './components/SystemResources';
 import OrchestratorChat from './components/OrchestratorChat';
 import AgentPanel from './components/AgentPanel';
+import ModelRecommendations from './components/ModelRecommendations';
 import TasksView from './components/TasksView';
 import AgentHistory from './components/AgentHistory';
+import MediaTimeline from './components/MediaTimeline';
+
+import CascadeWaterInpaint from './components/CascadeWaterInpaint';
+import ImageAnimator from './components/ImageAnimator';
+import ImageGenerator from './components/ImageGenerator';
+import MusicGenerator from './components/MusicGenerator';
 
 const NAV_ITEMS = [
-  { key: 'agentes', label: 'AGENTES', icon: '\u269B', title: 'Agentes \u0026 Recursos' },
-  { key: 'tarefas', label: 'TAREFAS', icon: '\u2611', title: 'Gestao de Tarefas' },
+  { key: 'agentes', label: 'AGENTES', icon: '🤖', title: 'Agentes & Recursos' },
+  { key: 'tarefas', label: 'TAREFAS', icon: '📋', title: 'Gestao de Tarefas' },
+  { key: 'produzir', label: 'PRODUZIR', icon: '🎨', title: 'Image + Video + Music' },
+  { key: 'media',   label: 'MEDIA',   icon: '🎬', title: 'Timeline Video/Musica' },
 ];
+
+// Module-level component — stable reference prevents re-mount flicker
+const SectionHeader = ({ title, emoji, colorVar, collapsed, onToggle, children }) => (
+  <div className="rounded-xl border overflow-hidden" style={{ borderColor: 'var(--border-subtle)', background: 'var(--bg-card)' }}>
+    <button
+      onClick={onToggle}
+      className="w-full flex items-center justify-between px-4 py-3 transition-colors hover:bg-[var(--bg-hover)]"
+      style={{ background: 'transparent' }}
+    >
+      <div className="flex items-center gap-2">
+        <span className="text-base">{emoji}</span>
+        <h2 className="text-sm font-bold font-mono tracking-wider" style={{ color: `var(${colorVar})` }}>
+          {title}
+        </h2>
+      </div>
+      <span className="text-lg" style={{ color: 'var(--text-muted)' }}>
+        {collapsed ? '+' : '-'}
+      </span>
+    </button>
+    {!collapsed && (
+      <div className="px-4 pb-4">{children}</div>
+    )}
+  </div>
+);
 
 function App() {
   const [socket, setSocket] = useState(null);
@@ -19,8 +52,16 @@ function App() {
   const [restarting, setRestarting] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
+  // Colapsible sections in PRODUZIR tab
+  const [collapsedSections, setCollapsedSections] = useState({
+    imageGen: false,
+    musicGen: false,
+    imageAnim: false,
+    cascadeWater: false,
+  });
+
   useEffect(() => {
-    const s = io('http://192.168.0.188:5020');
+    const s = io(window.location.origin);
 
     s.on('connect', () => {
       console.log('Socket.IO connected');
@@ -49,13 +90,13 @@ function App() {
     if (restarting) return;
     setRestarting(true);
     try {
-      await fetch('http://192.168.0.188:5020/api/restart', { method: 'POST' });
+      await fetch(`${window.location.origin}/api/restart`, { method: 'POST' });
     } catch (e) {
       console.log('Restart request sent');
     }
     let attempts = 0;
     const poll = setInterval(() => {
-      fetch('http://192.168.0.188:5020/health')
+      fetch(`${window.location.origin}/health`)
         .then(() => {
           clearInterval(poll);
           window.location.reload();
@@ -68,6 +109,13 @@ function App() {
           }
         });
     }, 1000);
+  };
+
+  const [generatedImage, setGeneratedImage] = useState(null);
+  const [generatedMusic, setGeneratedMusic] = useState(null);
+
+  const toggleSection = (key) => {
+    setCollapsedSections(prev => ({ ...prev, [key]: !prev[key] }));
   };
 
   return (
@@ -121,17 +169,17 @@ function App() {
         {!sidebarCollapsed && <span className="ml-2 text-[10px] font-mono tracking-wider">MENU</span>}
       </button>
 
-      {/* Main Content — centered block, 250px margin each side */}
-      <div 
+      {/* Main Content — centered block */}
+      <div
         className="min-h-screen flex flex-col mx-auto"
         style={{ width: 'calc(100vw - 500px)', marginLeft: 'auto', marginRight: 'auto' }}
       >
         {/* Header */}
         <header className="relative z-10 border-b border-[var(--border-subtle)] bg-[var(--bg-secondary)]/90 backdrop-blur-sm">
-          <div className="px-6 py-3 flex items-center justify-between">
+          <div className="px-6 py-2 flex items-center justify-between">
             <div className="flex items-center gap-3">
               <div className="pulse-dot bg-[var(--matrix-green)]" />
-              <h1 className="text-2xl font-bold glitch-text tracking-wider" style={{ color: 'var(--matrix-green)' }}>
+              <h1 className="text-sm font-bold glitch-text tracking-wider" style={{ color: 'var(--matrix-green)' }}>
                 AGENT<span style={{ color: 'var(--cyber-blue)' }}>GUI</span>
               </h1>
             </div>
@@ -164,27 +212,106 @@ function App() {
           </div>
         </header>
 
-        {/* Page Content — comfortable width, not edge-to-edge */}
-        <main className="relative z-10 flex-1 overflow-auto">
-          <div className="py-6">
+        {/* Compact System Resources Bar */}
+        <div
+          style={{
+            position: 'fixed',
+            top: 40,
+            left: sidebarCollapsed ? 56 : 192,
+            right: 0,
+            zIndex: 25,
+          }}
+        >
+          <SystemResources socket={socket} compact={true} />
+        </div>
+
+        {/* Page Content */}
+        <main className="relative z-10 flex-1 overflow-auto" style={{ paddingTop: 54 }}>
+          <div className="py-6 space-y-4">
+            {activeTab === 'produzir' && (
+              <div className="space-y-4">
+                {/* IMAGE GENERATOR */}
+                <SectionHeader
+                  title="IMAGE GENERATOR"
+                  emoji="🖼️"
+                  colorVar="--amber-warn"
+                  collapsed={collapsedSections.imageGen}
+                  onToggle={() => toggleSection('imageGen')}
+                >
+                  <ImageGenerator onImageGenerated={(img) => {
+                    setGeneratedImage(img);
+                    console.log('Image generated:', img);
+                  }} />
+                </SectionHeader>
+
+                {/* MUSIC GENERATOR */}
+                <SectionHeader
+                  title="MUSIC GENERATOR"
+                  emoji="🎵"
+                  colorVar="--cyber-blue"
+                  collapsed={collapsedSections.musicGen}
+                  onToggle={() => toggleSection('musicGen')}
+                >
+                  <MusicGenerator onMusicGenerated={(music) => {
+                    setGeneratedMusic(music);
+                    console.log('Music generated:', music);
+                  }} />
+                </SectionHeader>
+
+                {/* IMAGE ANIMATOR — existing ImageAnimator component */}
+                <SectionHeader
+                  title="IMAGE ANIMATOR — Efeitos Atmosfericos"
+                  emoji="✨"
+                  colorVar="--cyber-blue"
+                  collapsed={collapsedSections.imageAnim}
+                  onToggle={() => toggleSection('imageAnim')}
+                >
+                  <ImageAnimator onVideoToPool={(fn) => {
+                    console.log('Animated video added to pool:', fn);
+                  }} socket={socket} />
+                </SectionHeader>
+
+                {/* CASCADE WATER INPAINT — new component */}
+                <SectionHeader
+                  title="INPAINT CASCATA — Efeito de Agua"
+                  emoji="💧"
+                  colorVar="--matrix-green"
+                  collapsed={collapsedSections.cascadeWater}
+                  onToggle={() => toggleSection('cascadeWater')}
+                >
+                  <CascadeWaterInpaint onVideoToPool={(fn) => {
+                    console.log('Cascade video added to pool:', fn);
+                  }} />
+                </SectionHeader>
+              </div>
+            )}
+
+            {activeTab === 'media' && (
+              <div style={{
+                position: 'fixed',
+                top: 96,
+                left: sidebarCollapsed ? 56 : 192,
+                right: 0,
+                bottom: 0,
+                padding: 12,
+                overflow: 'hidden',
+              }}>
+                <MediaTimeline socket={socket} />
+              </div>
+            )}
+
             {activeTab === 'agentes' && (
               <div>
-                <section className="mb-6">
-                  <div className="flex items-center gap-2 mb-3">
-                    <div className="w-1.5 h-1.5 rounded-full bg-[var(--matrix-green)] animate-pulse" />
-                    <h2 className="text-xs font-mono font-bold tracking-wider text-[var(--matrix-green)] uppercase">
-                      System Resources
-                    </h2>
-                  </div>
-                  <SystemResources socket={socket} />
-                </section>
-
                 <section className="mb-6">
                   <OrchestratorChat socket={socket} />
                 </section>
 
                 <section className="mb-6">
                   <AgentPanel socket={socket} />
+                </section>
+
+                <section className="mb-6">
+                  <ModelRecommendations socket={socket} />
                 </section>
               </div>
             )}

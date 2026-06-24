@@ -1,115 +1,129 @@
 #!/usr/bin/env python3
 """
-Runner para o perfil Researcher.
-Recebe AGENT_ID como argumento.
-Escreve progresso para stdout (visivel no tmux) e resultado para log file.
+AgentGUI Profile Runner — researcher
+Reads task file, loads SOUL.md, invokes hermes chat with the correct model.
 """
 
 import sys
+import os
 import json
 import subprocess
-import os
 from pathlib import Path
+from datetime import datetime
 
-AGENT_ID = sys.argv[1]
+# --- Auto-injected Global Logger ---
+try:
+    from core.logger_config import setup_global_logging
+    setup_global_logging(str(Path(__file__).parent.parent / "logs"))
+except Exception as e:
+    print(f"Failed to initialize logger: {e}")
+# -------------------------------------
+
 BASE_DIR = Path(os.environ.get("AGENTUI_DIR", "/media/sf_AI_Ecosystem/10_Projects/02_AgentGUI"))
-TASK_FILE = BASE_DIR / "data" / f"{AGENT_ID}_task.json"
-LOG_FILE = BASE_DIR / "data" / f"{AGENT_ID}.log"
-
-def report(msg: str, progress: int = None):
-    """Print to tmux AND update state."""
-    print(f"[{AGENT_ID}] {msg}", flush=True)
-    try:
-        sys.path.insert(0, str(BASE_DIR))
-        from core.state import update_agent
-        if progress is not None:
-            update_agent(AGENT_ID, message=msg, progress=progress)
-        else:
-            update_agent(AGENT_ID, message=msg)
-    except Exception:
-        pass
+DATA_DIR = BASE_DIR / "data"
+PROFILE_NAME = "researcher"
+SOUL_FILE = Path.home() / ".hermes" / "profiles" / PROFILE_NAME / "SOUL.md"
 
 def main():
-    report("A ler tarefa e SOUL.md...", 10)
+    if len(sys.argv) < 2:
+        print(f"Usage: python3 run_researcher.py <agent_id>")
+        sys.exit(1)
+    
+    agent_id = sys.argv[1]
+    task_file = DATA_DIR / f"{agent_id}_task.json"
+    
+    if not task_file.exists():
+        print(f"[{agent_id}] Task file nao encontrado: {task_file}")
+        # Write done flag with error
+        done_flag = DATA_DIR / f"{agent_id}_done.flag"
+        done_flag.write_text("1")
+        sys.exit(1)
+    
+    task_data = json.loads(task_file.read_text())
+    goal = task_data.get("goal", "")
+    model = task_data.get("model")
+    
+    print(f"[{agent_id}] A ler tarefa e SOUL.md...")
+    print(f"[{agent_id}] Profile: {PROFILE_NAME}")
+    print(f"[{agent_id}] Model: {model or 'default'}")
+    print(f"[{agent_id}] Task: {goal[:100]}...")
+    
+    # Load SOUL.md if it exists
+    soul_content = ""
+    if SOUL_FILE.exists():
+        soul_content = SOUL_FILE.read_text(encoding="utf-8")
+    
+    # Load skills config
+    skills_config_path = Path.home() / ".hermes" / "profiles" / PROFILE_NAME / "skills_config.json"
+    enabled_skills = []
+    if skills_config_path.exists():
+        try:
+            sc = json.loads(skills_config_path.read_text())
+            enabled_skills = sc.get("enabled", [])
+        except Exception:
+            pass
+    
+    # Build prompt
+    prompt = f"""You are operating as the {PROFILE_NAME} profile in the AgentGUI ecosystem.
 
-    if not TASK_FILE.exists():
-        report(f"ERRO: Task file nao encontrado: {TASK_FILE}", 0)
-        return
-
-    with open(TASK_FILE, 'r', encoding='utf-8') as f:
-        task = json.load(f)
-
-    soul_path = Path.home() / ".hermes" / "profiles" / "researcher" / "SOUL.md"
-    soul = ""
-    if soul_path.exists():
-        with open(soul_path, 'r', encoding='utf-8') as f:
-            soul = f.read()
-
-    report("A construir prompt...", 20)
-
-    prompt = f"""{soul}
-
-## TAREFA
-{task['goal']}
-
-## CONTEXTO DO PROJETO
-{task.get('context', '')}
-
-## INSTRUCOES
-1. Executa a tarefa de acordo com as regras do perfil Researcher.
-2. Pesquisa web (web_search) e le ficheiros (read_file) conforme necessario.
-3. SINTETIZA os resultados -- nao copies resultados crus.
-4. Devolve a resposta final em Portugues (PT-PT).
-5. Inclui tabelas para comparacoes e links diretos para fontes.
-
-Comeca agora."""
-
-    report("A invocar hermes chat -q...", 30)
-
+"""
+    if soul_content:
+        prompt += f"=== SOUL.md (persona) ===\n{soul_content}\n\n"
+    
+    prompt += f"=== TASK ===\n{goal}\n"
+    
+    print(f"[{agent_id}] A construir prompt...")
+    print(f"[{agent_id}] A invocar hermes chat...")
+    
+    # Build hermes chat command
     cmd = ["hermes", "chat", "-q", prompt, "-Q", "--ignore-rules", "--source", "tool"]
+    
+    # Add model if specified
+    if model:
+        cmd.extend(["-m", model])
+    
+    # Add skills if any
+    if enabled_skills:
+        cmd.extend(["-s", ",".join(enabled_skills)])
+    
+    # Run hermes chat
     try:
-        with open(LOG_FILE, 'w', encoding='utf-8') as logf:
-            logf.write(f"=== AGENT: {AGENT_ID} ===\n")
-            logf.write(f"=== TASK: {task['goal']} ===\n\n")
-            
-            result = subprocess.run(
-                cmd,
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                timeout=task.get("timeout_seconds", 1200),
-                cwd=str(BASE_DIR)
-            )
-            
-            logf.write(f"\n=== RETURN CODE: {result.returncode} ===\n")
-
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600,  # 10 minute timeout
+            stdin=subprocess.DEVNULL
+        )
+        
+        output = result.stdout
+        if result.stderr:
+            output += f"\n[STDERR]\n{result.stderr}"
+        
+        print(f"[{agent_id}] Hermes chat completed with exit code {result.returncode}")
+        print(f"[{agent_id}] Output length: {len(output)} chars")
+        
+        # Write done flag
+        done_flag = DATA_DIR / f"{agent_id}_done.flag"
+        done_flag.write_text(str(result.returncode))
+        
         if result.returncode == 0:
-            report("Tarefa concluida", 100)
-            # Read log and store in state
-            try:
-                with open(LOG_FILE, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                sys.path.insert(0, str(BASE_DIR))
-                from core.state import update_agent
-                update_agent(AGENT_ID, status="completed", output_append=content[-9000:])
-            except Exception:
-                pass
+            print(f"[{agent_id}] Tarefa concluida")
         else:
-            report(f"Erro: return code {result.returncode}", 0)
-            sys.path.insert(0, str(BASE_DIR))
-            from core.state import update_agent
-            update_agent(AGENT_ID, status="error", error=f"RC {result.returncode}")
-
+            print(f"[{agent_id}] Tarefa terminou com erro (exit {result.returncode})")
+        
+        # Print output for tmux capture
+        if output:
+            print(output[:5000])
+        
     except subprocess.TimeoutExpired:
-        report("ERRO: Timeout", 0)
-        sys.path.insert(0, str(BASE_DIR))
-        from core.state import update_agent
-        update_agent(AGENT_ID, status="error", error="Timeout")
+        print(f"[{agent_id}] Timeout apos 600s")
+        done_flag = DATA_DIR / f"{agent_id}_done.flag"
+        done_flag.write_text("1")
     except Exception as e:
-        report(f"ERRO: {e}", 0)
-        sys.path.insert(0, str(BASE_DIR))
-        from core.state import update_agent
-        update_agent(AGENT_ID, status="error", error=str(e))
+        print(f"[{agent_id}] Erro: {e}")
+        done_flag = DATA_DIR / f"{agent_id}_done.flag"
+        done_flag.write_text("1")
 
 if __name__ == "__main__":
     main()

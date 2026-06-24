@@ -1,0 +1,50 @@
+/* Media Timeline v2.5 — Visual fixes + ruler + track dividers + header alignment */
+
+/* Track dividers - visible lines between tracks */
+.timeline-lane-row {
+  position: relative;
+}
+
+.timeline-lane-row::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: rgba(255,255,255,0.08);
+}
+
+.timeline-lane-row:last-child::after {
+  display: none;
+}
+
+/* Ruler labels adaptativas */
+.ruler-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  color: var(--text-secondary);
+  margin-top: 2px;
+  white-space: nowrap;
+}
+
+/* Ruler line com cor adaptativa */
+.ruler-line {
+  width: 1px;
+  flex-shrink: 0;
+}
+
+/* Track grid lines com opacidade adaptativa */
+.track-grid-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  pointer-events: none;
+}
+
+/* Clip selected glow */
+.clip-selected {
+  box-shadow: 0 0 0 2px rgba(255,255,255,0.2);
+  z-index: 10;
+}

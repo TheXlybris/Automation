@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 
-function SystemResources({ socket }) {
+function SystemResources({ socket, compact = false }) {
   const [data, setData] = useState(null);
 
   useEffect(() => {
@@ -10,6 +10,7 @@ function SystemResources({ socket }) {
   }, [socket]);
 
   if (!data) {
+    if (compact) return null;
     return (
       <div className="flex items-center justify-center h-16 text-[var(--text-dim)] text-xs font-mono">
         <span className="animate-pulse">Initializing resource monitor...</span>
@@ -19,6 +20,36 @@ function SystemResources({ socket }) {
 
   const vm = data.vm || {};
   const win = data.windows;
+
+  if (compact) {
+    return (
+      <div className="w-full border-b border-[var(--border-subtle)] bg-[var(--bg-secondary)]/80 backdrop-blur-sm"
+           style={{ padding: '8px 16px' }}>
+        <div className="flex items-center gap-6 overflow-x-auto" style={{ minHeight: 38 }}>
+          {/* Windows Host */}
+          {win ? (
+            <>
+              <MicroBar label="W-CPU" value={win.cpu?.percent || 0} color="#00d4ff" />
+              <MicroBar label="W-RAM" value={win.ram?.percent || 0} color="#00ff41" />
+              <MicroBar label="C:" value={win.disks?.c?.percent || 0} color="#ffb800" />
+              <MicroBar label="D:" value={win.disks?.d?.percent || 0} color="#ff7b00" />
+              {win.gpu && <MicroBar label="GPU" value={win.gpu.gpu_percent || 0} color="#b829dd" />}
+            </>
+          ) : (
+            <span className="text-[10px] font-mono text-[var(--text-dim)] whitespace-nowrap">Waiting for Windows host...</span>
+          )}
+
+          {/* Divider */}
+          <div className="w-px h-5 bg-[var(--border-subtle)] flex-shrink-0" />
+
+          {/* VM */}
+          <MicroBar label="V-CPU" value={vm.cpu?.percent || 0} color="#4a6a5a" />
+          <MicroBar label="V-RAM" value={vm.ram?.percent || 0} color="#4a6a5a" />
+          <MicroBar label="V-DISK" value={vm.disk?.percent || 0} color="#4a6a5a" />
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 mb-6">
@@ -72,6 +103,27 @@ function SystemResources({ socket }) {
           <MiniBar label="DISK" value={vm.disk?.percent || 0} sub={`${vm.disk?.used_gb || 0}/${vm.disk?.total_gb || 0} GB`} color="#4a6a5a" />
         </div>
       </div>
+    </div>
+  );
+}
+
+function MicroBar({ label, value, color }) {
+  const safeValue = Math.min(Math.max(Number(value) || 0, 0), 100);
+  return (
+    <div className="flex items-center gap-2 flex-shrink-0" title={`${label}: ${Math.round(safeValue)}%`}>
+      <span className="text-[10px] font-mono font-bold whitespace-nowrap" style={{ color, width: 38, textAlign: 'right' }}>{label}</span>
+      <div className="rounded-full overflow-hidden" style={{ width: 48, height: 5, background: 'var(--bg-card)', border: '1px solid var(--border-subtle)' }}>
+        <div
+          className="h-full rounded-full"
+          style={{
+            width: `${safeValue}%`,
+            backgroundColor: color,
+            opacity: 0.9,
+            transition: 'width 0.3s ease',
+          }}
+        />
+      </div>
+      <span className="text-[9px] font-mono" style={{ color, minWidth: 24 }}>{Math.round(safeValue)}%</span>
     </div>
   );
 }

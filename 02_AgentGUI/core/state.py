@@ -14,7 +14,7 @@ from typing import Dict, Optional
 STATE_FILE = Path(__file__).parent.parent / "data" / "agent_state.json"
 STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-_lock = threading.Lock()
+_lock = threading.RLock()
 
 def _ensure_file():
     if not STATE_FILE.exists():
@@ -62,36 +62,37 @@ def update_agent(agent_id: str, status: Optional[str] = None,
     Atomically update an agent's state.
     Use output_append to append to the output buffer (truncated at 10k chars).
     """
-    state = _read_state()
-    if agent_id not in state["agents"]:
-        return None
+    with _lock:
+        state = _read_state()
+        if agent_id not in state["agents"]:
+            return None
 
-    agent = state["agents"][agent_id]
+        agent = state["agents"][agent_id]
 
-    if status is not None:
-        agent["status"] = status
-        if status == "running" and agent["started_at"] is None:
-            agent["started_at"] = datetime.now().isoformat()
-        if status in ("completed", "error", "cancelled"):
-            agent["finished_at"] = datetime.now().isoformat()
+        if status is not None:
+            agent["status"] = status
+            if status == "running" and agent["started_at"] is None:
+                agent["started_at"] = datetime.now().isoformat()
+            if status in ("completed", "error", "cancelled"):
+                agent["finished_at"] = datetime.now().isoformat()
 
-    if progress is not None:
-        agent["progress"] = max(0, min(100, progress))
+        if progress is not None:
+            agent["progress"] = max(0, min(100, progress))
 
-    if message is not None:
-        agent["message"] = message
+        if message is not None:
+            agent["message"] = message
 
-    if output_append is not None:
-        agent["output"] = (agent.get("output", "") + output_append)[-10000:]
+        if output_append is not None:
+            agent["output"] = (agent.get("output", "") + output_append)[-10000:]
 
-    if error is not None:
-        agent["error"] = error
-        agent["status"] = "error"
+        if error is not None:
+            agent["error"] = error
+            agent["status"] = "error"
 
-    if pid is not None:
-        agent["pid"] = pid
+        if pid is not None:
+            agent["pid"] = pid
 
-    _write_state(state)
+        _write_state(state)
     return agent
 
 def get_agent(agent_id: str) -> Optional[dict]:
@@ -119,7 +120,6 @@ def cleanup_old_agents(max_age_hours: int = 24) -> int:
             finished = agent.get("finished_at")
             if finished:
                 try:
-                    from datetime import datetime
                     dt = datetime.fromisoformat(finished)
                     if (now - dt).total_seconds() > max_age_hours * 3600:
                         del state["agents"][agent_id]
@@ -128,6 +128,26 @@ def cleanup_old_agents(max_age_hours: int = 24) -> int:
                     pass
     _write_state(state)
     return removed
+
+def delete_agent(agent_id: str) -> bool:
+    """Delete an agent from state. Returns True if found and deleted."""
+    state = _read_state()
+    if agent_id in state["agents"]:
+        del state["agents"][agent_id]
+        _write_state(state)
+        return True
+    return False
+
+def delete_finished_agents() -> int:
+    """Delete all agents with status completed, error, or cancelled. Returns count deleted."""
+    state = _read_state()
+    finished_statuses = ("completed", "error", "cancelled")
+    to_delete = [aid for aid, a in state["agents"].items() if a.get("status") in finished_statuses]
+    for aid in to_delete:
+        del state["agents"][aid]
+    if to_delete:
+        _write_state(state)
+    return len(to_delete)
 
 def get_last_update_timestamp() -> str:
     state = _read_state()

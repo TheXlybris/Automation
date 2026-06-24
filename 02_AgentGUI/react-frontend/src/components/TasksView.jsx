@@ -1,10 +1,12 @@
 import { useState } from 'react';
 import AgentCard from './AgentCard';
 import CronTasksView from './CronTasksView';
+import { api } from '../services/api';
 
 export default function TasksView({ socket, agents }) {
   const [subTab, setSubTab] = useState('ativas');
   const [filter, setFilter] = useState('all');
+  const [clearing, setClearing] = useState(false);
 
   const filtered = filter === 'all' ? agents : agents.filter(a => a.status === filter);
 
@@ -13,6 +15,25 @@ export default function TasksView({ socket, agents }) {
     running: agents.filter(a => a.status === 'running').length,
     completed: agents.filter(a => a.status === 'completed').length,
     error: agents.filter(a => a.status === 'error').length,
+  };
+
+  const finishedCount = counts.completed + counts.error + agents.filter(a => a.status === 'cancelled').length;
+
+  const handleClearFinished = async () => {
+    if (finishedCount === 0) return;
+    if (!confirm(`Apagar ${finishedCount} tarefa(s) concluída(s) (com sucesso ou erro)?`)) return;
+    setClearing(true);
+    try {
+      await api.clearFinished();
+    } catch (err) {
+      console.error('Erro ao limpar concluídos:', err);
+    } finally {
+      setClearing(false);
+    }
+  };
+
+  const handleRefresh = () => {
+    if (socket) socket.emit('refresh_agents');
   };
 
   const FILTERS = [
@@ -47,13 +68,29 @@ export default function TasksView({ socket, agents }) {
       {/* Sub-tab: Ativas */}
       {subTab === 'ativas' && (
         <div>
-          <div className="tasks-header">
+          <div className="tasks-header flex items-center justify-between">
             <div className="flex items-center gap-2 mb-4">
               <div className="w-1.5 h-1.5 rounded-full bg-[var(--cyber-blue)] animate-pulse" />
               <h2 className="text-xs font-mono font-bold tracking-wider text-[var(--cyber-blue)] uppercase">
                 Gestao de Tarefas
               </h2>
             </div>
+            {finishedCount > 0 && (
+              <button
+                onClick={handleClearFinished}
+                disabled={clearing}
+                className="px-4 py-2 rounded-lg font-mono text-xs tracking-wider transition-all duration-300 border mb-4"
+                style={{
+                  borderColor: 'rgba(239,68,68,0.3)',
+                  background: 'rgba(239,68,68,0.06)',
+                  color: '#ef4444',
+                  opacity: clearing ? 0.5 : 1,
+                  cursor: clearing ? 'wait' : 'pointer',
+                }}
+              >
+                {clearing ? 'A apagar...' : `🗑 Apagar Concluídos (${finishedCount})`}
+              </button>
+            )}
           </div>
 
           {/* Filter buttons */}
@@ -83,7 +120,7 @@ export default function TasksView({ socket, agents }) {
               </div>
             ) : (
               filtered.map(agent => (
-                <AgentCard key={agent.id} agent={agent} />
+                <AgentCard key={agent.id} agent={agent} onDelete={handleRefresh} />
               ))
             )}
           </div>

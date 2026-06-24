@@ -1,4 +1,4 @@
-const API_BASE = 'http://192.168.0.188:5020';  // Flask server na VM
+const API_BASE = window.location.origin;  // Flask server na VM
 
 async function request(path, opts = {}) {
   const url = `${API_BASE}${path}`;
@@ -19,6 +19,8 @@ export const api = {
   getOutput: (id)    => request(`/api/agents/${id}/output`),
   kill:      (id)    => request(`/api/agents/${id}/kill`, { method: 'POST' }),
   getAgent:  (id)    => request(`/api/agents/${id}`),
+  deleteAgent: (id)  => request(`/api/agents/${id}`, { method: 'DELETE' }),
+  clearFinished: ()  => request('/api/agents/clear-finished', { method: 'POST' }),
 
   subscribe: (onMessage) => {
     const src = new EventSource(`${API_BASE}/api/stream`);

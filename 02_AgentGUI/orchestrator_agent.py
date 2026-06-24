@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Orchestrator Agent v1.0 — Mini-Agente Completo para AgentGUI.
+Orchestrator Agent v2.3 — Mini-Agente Completo para AgentGUI.
 
-Loop de agente: recebe mensagem -> chama LLM -> se decidir usar tool, executa -> 
+Loop de agente: recebe mensagem -> chama LLM -> se decidir usar tool, executa ->
 observa resultado -> repete até ter resposta final.
 
 Comunicação: Socket.IO client com server.py (bidirecional).
@@ -33,14 +33,45 @@ SUMMARY_FILE = DATA_DIR / "orchestrator_summary.json"
 MODE_FILE = DATA_DIR / "orchestrator_mode.json"
 SERVER_URL = "http://192.168.0.188:5020"
 
-# API Ollama Cloud
-API_KEY=os.environ.get("OLLAMA_API_KEY", "")
-BASE_URL = os.environ.get("OLLAMA_BASE_URL", "https://ollama.com/v1")
-MODEL = "kimi-k2.6"
+# API config — loaded dynamically from profile config
+# Local Ollama:  http://192.168.0.187:11434/v1
+# Ollama Cloud:   https://ollama.com/v1
+ORCH_CONFIG_FILE = Path.home() / ".hermes" / "profiles" / "orchestrator" / "agentgui_config.json"
 
-MAX_HISTORY = 30     # janela deslizante
+CLOUD_MODELS = {"kimi-k2.6", "glm-5.2", "deepseek-v4-pro", "qwen3-coder:480b"}
+LOCAL_OLLAMA_URL = "http://192.168.0.187:11434/v1"
+CLOUD_OLLAMA_URL = "https://ollama.com/v1"
+
+def _load_api_config():
+    """Read model + base_url from profile config file, fall back to defaults."""
+    model = "kimi-k2.6"
+    base_url = CLOUD_OLLAMA_URL
+    api_key = os.environ.get("OLLAMA_API_KEY", "")
+
+    if ORCH_CONFIG_FILE.exists():
+        try:
+            cfg = json.loads(ORCH_CONFIG_FILE.read_text())
+            cfg_model = cfg.get("model")
+            if cfg_model:
+                model = cfg_model
+                # Auto-detect: cloud vs local based on model name
+                if cfg_model not in CLOUD_MODELS and not cfg_model.endswith(":cloud"):
+                    base_url = LOCAL_OLLAMA_URL
+                    # Local Ollama doesn't need API key, but send empty string
+                    api_key = api_key or "ollama"
+                else:
+                    base_url = CLOUD_OLLAMA_URL
+        except Exception as e:
+            print(f"[WARN] Could not read orchestrator config: {e}")
+
+    return model, base_url, api_key
+
+# Initial load
+MODEL, BASE_URL, API_KEY = _load_api_config()
+
+MAX_HISTORY = 30      # janela deslizante
 SUMMARY_THRESHOLD = 20  # quando atinge 20 msgs, resumir primeiras 10
-MAX_TURNS = 8        # máximo de iterações de tool-calling por mensagem
+MAX_TURNS = 8         # máximo de iterações de tool-calling por mensagem
 
 # ─── Tools definition ────────────────────────────────
 
@@ -324,6 +355,27 @@ def save_mode(mode: str):
     MODE_FILE.parent.mkdir(parents=True, exist_ok=True)
     MODE_FILE.write_text(json.dumps({"mode": mode}), encoding="utf-8")
 
+SYSTEM_PROMPT_BASE = textwrap.dedent("""\
+    És o Orquestrador Hermes, um agente de IA que opera dentro do AgentGUI.
+
+    As tuas capacidades:
+    - Ler ficheiros e directorias
+    - Consultar a wiki Obsidian do projecto
+    - Pesquisar na web (modo Orquestrador)
+    - Criar/modificar ficheiros (modo Orquestrador)
+    - Executar comandos no terminal (modo Orquestrador)
+
+    Regras:
+    1. Responde sempre em português (PT-PT)
+    2. Seja directo e técnico
+    3. Quando usar tools, pensa passo a passo
+    4. Se não souberes algo, admite-o
+    5. O utilizador pode alternar entre modos Brainstorm e Orquestrador
+
+    O projecto actual é o AgentGUI, um dashboard para orquestração de agentes LLM.
+    A wiki está em /media/sf_AI_Ecosystem/12_LLM_Wiki/AgentGUI/Wiki/
+    """)
+
 def build_messages(history: List[Dict], summary: str, mode: str) -> List[Dict]:
     """Constrói a lista de mensagens para o LLM a partir do histórico."""
     sys_content = SYSTEM_PROMPT_BASE
@@ -332,41 +384,20 @@ def build_messages(history: List[Dict], summary: str, mode: str) -> List[Dict]:
         sys_content += "\nPodes consultar ficheiros e wiki, mas NÃO podes criar/modificar ficheiros nem executar comandos."
     else:
         sys_content += "\nTens acesso completo a todas as tools. Podes criar ficheiros, executar comandos, e pesquisar na web."
-    
+
     if summary:
         sys_content += f"\n\n## Resumo da Conversa Anterior\n{summary}"
-    
+
     messages = [{"role": "system", "content": sys_content}]
-    
+
     # Adicionar últimas mensagens do histórico (sliding window)
     for msg in history[-MAX_HISTORY:]:
         messages.append({
             "role": msg.get("role", "user"),
             "content": msg.get("text", "")
         })
-    
-    return messages
 
-SYSTEM_PROMPT_BASE = textwrap.dedent("""\
-    És o Orquestrador Hermes, um agente de IA que opera dentro do AgentGUI.
-    
-    As tuas capacidades:
-    - Ler ficheiros e directorias
-    - Consultar a wiki Obsidian do projecto
-    - Pesquisar na web (modo Orquestrador)
-    - Criar/modificar ficheiros (modo Orquestrador)
-    - Executar comandos no terminal (modo Orquestrador)
-    
-    Regras:
-    1. Responde sempre em português (PT-PT)
-    2. Seja directo e técnico
-    3. Quando usar tools, pensa passo a passo
-    4. Se não souberes algo, admite-o
-    5. O utilizador pode alternar entre modos Brainstorm e Orquestrador
-    
-    O projecto actual é o AgentGUI, um dashboard para orquestração de agentes LLM.
-    A wiki está em /media/sf_AI_Ecosystem/12_LLM_Wiki/AgentGUI/Wiki/
-    """)
+    return messages
 
 # ─── LLM API Call ────────────────────────────────────
 
@@ -385,7 +416,7 @@ def call_llm(messages: List[Dict], tools: List[Dict], max_tokens: int = 4096) ->
         "max_tokens": max_tokens,
         "temperature": 0.7
     }
-    
+
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=120)
         resp.raise_for_status()
@@ -399,15 +430,20 @@ def call_llm(messages: List[Dict], tools: List[Dict], max_tokens: int = 4096) ->
 
 def process_user_message(text: str, mode: str) -> str:
     """Processa uma mensagem do utilizador e retorna a resposta final."""
-    
+
+    # Reload API config (in case user changed model via SettingsModal)
+    global MODEL, BASE_URL, API_KEY
+    MODEL, BASE_URL, API_KEY = _load_api_config()
+    print(f"[CONFIG] Model={MODEL} | Base={BASE_URL} | Key={'set' if API_KEY else 'none'}")
+
     # Carregar estado
     history = load_history()
     summary = load_summary()
     tools = ORCHESTRATOR_TOOLS if mode == "orchestrator" else BRAINSTORM_TOOLS
-    
+
     # Adicionar mensagem do utilizador ao histórico
     history.append({"role": "user", "text": text, "time": datetime.now().isoformat()})
-    
+
     # Verificar se precisa de resumo automático
     if len(history) >= SUMMARY_THRESHOLD:
         # Resumir primeiras 10 mensagens
@@ -419,67 +455,71 @@ def process_user_message(text: str, mode: str) -> str:
         # Remover do histórico activo
         history = history[10:]
         print(f"[INFO] Resumo automático gerado ({len(to_summarize)} mensagens)")
-    
+
     save_history(history)
-    
+
     # Construir mensagens para LLM
     messages = build_messages(history, load_summary(), mode)
-    
+
     # Agent loop: até não haver tool calls ou atingir MAX_TURNS
     for turn in range(MAX_TURNS):
         print(f"[TURN {turn + 1}/{MAX_TURNS}] Chamando LLM...")
         response = call_llm(messages, tools)
-        
+
         if "error" in response:
             error_msg = f"[Erro do sistema] {response['error']}"
             history.append({"role": "assistant", "text": error_msg, "time": datetime.now().isoformat()})
             save_history(history)
             return error_msg
-        
+
         choice = response.get("choices", [{}])[0]
         msg = choice.get("message", {})
         content = msg.get("content", "")
         tool_calls = msg.get("tool_calls", [])
-        
+
         if not tool_calls:
             # Resposta final — sem tool calls
             history.append({"role": "assistant", "text": content, "time": datetime.now().isoformat()})
             save_history(history)
             return content
-        
+
         # Processar tool calls
         messages.append(msg)
-        
+
         for tc in tool_calls:
             func = tc.get("function", {})
             tool_name = func.get("name", "")
-            tool_args = json.loads(func.get("arguments", "{}"))
+            tool_args_raw = func.get("arguments", "{}")
+            try:
+                tool_args = json.loads(tool_args_raw)
+            except json.JSONDecodeError:
+                tool_args = {}
             tool_id = tc.get("id", "")
-            
+
             print(f"[TOOL] {tool_name}({tool_args})")
-            
+
             # Executar tool
             if tool_name in TOOL_MAP:
                 result = TOOL_MAP[tool_name](**tool_args)
             else:
                 result = f"[ERRO] Tool '{tool_name}' não existe."
-            
+
             print(f"[TOOL RESULT] {result[:200]}...")
-            
+
             # Adicionar resultado ao contexto
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_id,
                 "content": result
             })
-            
+
             # Também guardar no histórico como system
             history.append({
                 "role": "system",
                 "text": f"[Tool: {tool_name}] {result[:500]}",
                 "time": datetime.now().isoformat()
             })
-    
+
     # Max turns atingido
     final_msg = "[Atingido limite de iterações. A resposta pode estar incompleta.]"
     history.append({"role": "assistant", "text": final_msg, "time": datetime.now().isoformat()})
@@ -493,7 +533,7 @@ def summarize_history(messages: List[Dict]) -> str:
         r = m.get("role", "user")
         t = m.get("text", "")[:200]
         summary_prompt += f"{r}: {t}\n"
-    
+
     url = f"{BASE_URL}/chat/completions"
     headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
     payload = {
@@ -505,7 +545,7 @@ def summarize_history(messages: List[Dict]) -> str:
         "max_tokens": 500,
         "temperature": 0.3
     }
-    
+
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=60)
         data = resp.json()
@@ -518,46 +558,48 @@ def summarize_history(messages: List[Dict]) -> str:
 def run_agent():
     """Loop principal do agente."""
     print("=" * 60)
-    print("  ORCHESTRATOR AGENT v1.0")
-    print("  Modo: Brainstorm (default)")
-    print("  Server:", SERVER_URL)
+    print("  ORCHESTRATOR AGENT v2.3")
+    print(f"  Modo: {load_mode()}")
+    print(f"  Server: {SERVER_URL}")
+    print(f"  Model: {MODEL}")
+    print(f"  API Key: {'configured' if API_KEY else 'MISSING'}")
     print("=" * 60)
-    
+
     sio = socketio.Client()
-    
+
     @sio.event
     def connect():
         print("[Socket.IO] Conectado ao server.py")
         # Notificar que o orquestrador está online
         sio.emit("orchestrator_ready", {"status": "online", "mode": load_mode()})
-    
+
     @sio.event
     def disconnect():
         print("[Socket.IO] Desconectado do server.py")
-    
+
     @sio.on("orchestrator_message")
     def on_orchestrator_message(data):
-        """Recebe mensagem do dashboard via Socket.IO (se server reencaminhar)."""
+        """Recebe mensagem do dashboard via Socket.IO."""
         text = data.get("text", "")
         if not text:
             return
         print(f"[MSG] User: {text[:80]}...")
-        
+
         mode = load_mode()
-        
+
         # Notificar que está a processar
         sio.emit("orchestrator_typing", {})
-        
+
         try:
             response = process_user_message(text, mode)
         except Exception as e:
             response = f"[Erro interno do agente] {e}"
             print(f"[ERROR] {e}")
-        
+
         # Enviar resposta
         sio.emit("orchestrator_response", {"text": response, "mode": mode})
         print(f"[RESP] {response[:100]}...")
-    
+
     @sio.on("orchestrator_mode_change")
     def on_mode_change(data):
         new_mode = data.get("mode", "brainstorm")
@@ -567,7 +609,7 @@ def run_agent():
             "text": f"Modo alterado para **{new_mode.upper()}**.",
             "mode": new_mode
         })
-    
+
     @sio.on("orchestrator_summarize")
     def on_summarize(data):
         history = load_history()
@@ -581,7 +623,7 @@ def run_agent():
         sio.emit("orchestrator_response", {
             "text": f"**Resumo gerado:**\n\n{summary}"
         })
-    
+
     # Conectar
     try:
         sio.connect(SERVER_URL, wait_timeout=10)
@@ -590,13 +632,13 @@ def run_agent():
         print("[INFO] A tentar modo fallback (polling de inbox.json)...")
         run_fallback()
         return
-    
+
     # Loop principal (poll do inbox como fallback)
     last_inbox_len = 0
     try:
         while True:
             time.sleep(2)
-            
+
             # Fallback: também verificar inbox.json (se server não reencaminhar via Socket.IO)
             if INBOX_FILE.exists():
                 try:

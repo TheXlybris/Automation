@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
+import SettingsModal from './SettingsModal';
 
 export default function OrchestratorChat({ socket }) {
   const [messages, setMessages] = useState([]);
@@ -7,12 +8,32 @@ export default function OrchestratorChat({ socket }) {
   const [mode, setMode] = useState('brainstorm');
   const [agentOnline, setAgentOnline] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
+
+  // Settings modal state
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [currentModel, setCurrentModel] = useState('');
   const timeoutRef = useRef(null);
   const bottomRef = useRef(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isTyping]);
+
+  // Load orchestrator model from backend
+  useEffect(() => {
+    const loadModel = async () => {
+      try {
+        const res = await fetch(`${window.location.origin}/api/orchestrator/status`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.model) setCurrentModel(data.model);
+        }
+      } catch (e) {}
+    };
+    loadModel();
+    const modelInterval = setInterval(loadModel, 5000);
+    return () => clearInterval(modelInterval);
+  }, []);
 
   useEffect(() => {
     if (!socket) return;
@@ -52,7 +73,7 @@ export default function OrchestratorChat({ socket }) {
 
     const pollStatus = async () => {
       try {
-        const res = await fetch('http://192.168.0.188:5020/api/orchestrator/status');
+        const res = await fetch(`${window.location.origin}/api/orchestrator/status`);
         if (res.ok) {
           const data = await res.json();
           if (data && data.status) {
@@ -113,6 +134,27 @@ export default function OrchestratorChat({ socket }) {
 
   return (
     <div className="orchestrator-chat">
+      {/* Settings modal */}
+      {settingsOpen && (
+        <SettingsModal
+          agentId="orchestrator"
+          agentName="Orquestrador"
+          currentModel={(() => { try { return localStorage.getItem('agent_model_orchestrator') || ''; } catch { return ''; } })()}
+          onSave={async (model) => {
+            try { localStorage.setItem('agent_model_orchestrator', model || ''); } catch {}
+            setCurrentModel(model || '');
+            // Persist to backend so orchestrator_agent.py picks it up
+            try {
+              await fetch(`${window.location.origin}/api/profiles/orchestrator/config`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model: model || null })
+              });
+            } catch (e) { /* silent */ }
+          }}
+          onClose={() => setSettingsOpen(false)}
+        />
+      )}
       <div className="orchestrator-header">
         <div className="flex items-center gap-2">
           <span className={`w-2 h-2 rounded-full ${agentOnline ? 'bg-[var(--matrix-green)] animate-pulse' : 'bg-[var(--text-muted)]'}`} />
@@ -124,6 +166,11 @@ export default function OrchestratorChat({ socket }) {
           </span>
           {!agentOnline && (
             <span className="text-[10px] font-mono text-[var(--alert-red)]">OFFLINE</span>
+          )}
+          {currentModel && (
+            <span className="text-[9px] font-mono px-1.5 py-0.5 rounded border border-[var(--border-subtle)] text-[var(--text-dim)]" title="Modelo ativo">
+              {currentModel.includes(':cloud') || currentModel === 'kimi-k2.6' || currentModel === 'glm-5.2' || currentModel === 'deepseek-v4-pro' ? '☁️' : '💻'} {currentModel}
+            </span>
           )}
         </div>
         <div className="flex items-center gap-2">
@@ -142,6 +189,13 @@ export default function OrchestratorChat({ socket }) {
             title={`Mudar para modo ${mode === 'brainstorm' ? 'Orquestrador' : 'Brainstorm'}`}
           >
             🔄 {mode === 'brainstorm' ? '→ Orquestrador' : '→ Brainstorm'}
+          </button>
+          <button
+            onClick={() => setSettingsOpen(true)}
+            className="text-[10px] font-mono px-2 py-1 rounded border border-[var(--border-subtle)] text-[var(--text-muted)] hover:text-[var(--cyber-blue)] hover:border-[var(--cyber-blue)] transition-colors"
+            title="Configurar modelo do orquestrador"
+          >
+            ⚙️
           </button>
           <span className="text-[10px] font-mono text-[var(--text-muted)]">v2.3</span>
         </div>

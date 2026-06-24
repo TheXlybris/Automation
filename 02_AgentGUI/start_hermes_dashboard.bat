@@ -32,7 +32,7 @@ echo [*] Checking Hermes Dashboard status on VM...
 ssh -i "%SSH_KEY%" -o StrictHostKeyChecking=no -o ConnectTimeout=5 %VM_USER%@%VM_IP% "curl -sf http://127.0.0.1:%VM_PORT%/" >nul 2>&1
 if errorlevel 1 (
     echo     Dashboard offline. Starting now...
-    ssh -i "%SSH_KEY%" -o StrictHostKeyChecking=no -o ConnectTimeout=10 %VM_USER%@%VM_IP% "export PATH=\"/home/%VM_USER%/.local/bin:$PATH\" && nohup hermes dashboard ^> /tmp/hermes_dashboard.log 2^>^&1 ^& sleep 3"
+    ssh -i "%SSH_KEY%" -o StrictHostKeyChecking=no -o ConnectTimeout=10 %VM_USER%@%VM_IP% "bash /home/%VM_USER%/start_hermes_dashboard_vm.sh"
     if errorlevel 1 (
         echo [ERROR] Could not start Hermes Dashboard. Check VM is reachable.
         pause

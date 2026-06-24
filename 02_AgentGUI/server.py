@@ -1,850 +1,924 @@
 #!/usr/bin/env python3
 """
-AgentGUI Server v2.0 — Flask + Socket.IO for real-time agent monitoring.
-Runs on http://0.0.0.0:5020
+AgentGUI Server v3.0 — Flask + Socket.IO + Orchestrator + Cron + Real Model Selection.
 
-CHANGELOG:
-- 2026-06-11: Migrated SSE → Socket.IO (bidirectional WebSocket)
-- 2026-06-11: React frontend served as static files
-- 2026-06-11: Added health check endpoint
-- 2026-06-11: Kept all REST API endpoints for backwards compat
+Reconstructed 2026-06-24 with working model selection (frontend → backend → runner → hermes chat -m MODEL).
 """
 
+import os
+import sys
 import json
 import time
-import threading
-import os
 import uuid
-import shutil
+import subprocess
+import threading
+import requests as _requests
 from pathlib import Path
 from datetime import datetime
-from flask import Flask, render_template, jsonify, request, Response, send_from_directory
+from collections import OrderedDict
+
+from flask import Flask, jsonify, request, send_from_directory, send_file, Response
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
-
-import subprocess
-
-# Import core modules
-project_root = Path(__file__).parent
-os.chdir(project_root)
-import sys
-sys.path.insert(0, str(project_root))
-
-from core.state import (
-    register_agent, update_agent, get_agent,
-    list_agents, cleanup_old_agents, get_last_update_timestamp
-)
-from core.runner import (
-    launch_agent, get_agent_output, kill_agent,
-    send_keys_to_agent, sync_running_agents
-)
 import psutil
 
-# ─── Flask + Socket.IO setup ─────────────────────────
-app = Flask(__name__, static_folder='static', static_url_path='/')
-app.config['SECRET_KEY'] = 'agentgui-secret-key-change-me'
-CORS(app, origins=['http://localhost:5173', 'http://192.168.0.188:5173', 'http://127.0.0.1:5173', 'http://localhost:5020', 'http://192.168.0.188:5020'])
+try:
+    import git
+    HAS_GIT = True
+except ImportError:
+    HAS_GIT = False
 
+# ─── Config ───────────────────────────────────────────
+project_root = Path(__file__).parent
+os.chdir(project_root)
+sys.path.insert(0, str(project_root))
+
+DATA_DIR = project_root / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Load .env for OLLAMA_API_KEY
+HERMES_ENV = Path.home() / ".hermes" / ".env"
+if HERMES_ENV.exists():
+    for line in HERMES_ENV.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
+app = Flask(__name__, static_folder='static', static_url_path='/')
+CORS(app, origins="*")
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
-# ─── Shared state for Windows resources ──────────────────
+# Import core modules
+try:
+    from core.state import (
+        register_agent, update_agent, get_agent,
+        list_agents, cleanup_old_agents, get_last_update_timestamp,
+        delete_agent, delete_finished_agents
+    )
+    from core.runner import (
+        launch_agent, get_agent_output, kill_agent,
+        send_keys_to_agent, sync_running_agents
+    )
+except ImportError as e:
+    print(f"Critical Error: Could not import core modules. {e}")
+
+# ─── Profile Config (real model selection) ────────────
+HERMES_PROFILES_DIR = Path.home() / ".hermes" / "profiles"
+HERMES_SKILLS_DIR = Path.home() / ".hermes" / "skills"
+BUNDLED_MANIFEST = HERMES_SKILLS_DIR / ".bundled_manifest"
+
+def get_profile_config_path(profile_id: str) -> Path:
+    return HERMES_PROFILES_DIR / profile_id / "agentgui_config.json"
+
+def load_profile_config(profile_id: str) -> dict:
+    p = get_profile_config_path(profile_id)
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            pass
+    return {"model": None, "provider": None}
+
+def save_profile_config(profile_id: str, config: dict):
+    p = get_profile_config_path(profile_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+def get_profile_skills_config_path(profile_id: str) -> Path:
+    return HERMES_PROFILES_DIR / profile_id / "skills_config.json"
+
+def load_skills_config(profile_id: str) -> dict:
+    p = get_profile_skills_config_path(profile_id)
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            pass
+    # Auto-merge: all enabled by default
+    all_skills = list_all_skills()
+    return {"enabled": [s["name"] for s in all_skills], "disabled": []}
+
+def save_skills_config(profile_id: str, config: dict):
+    p = get_profile_skills_config_path(profile_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+def list_all_skills() -> list:
+    """List all available skills from ~/.hermes/skills/ with category grouping."""
+    skills = []
+    # Check bundled manifest to distinguish builtin vs local
+    builtin_names = set()
+    if BUNDLED_MANIFEST.exists():
+        for line in BUNDLED_MANIFEST.read_text().splitlines():
+            if ":" in line:
+                name = line.split(":")[0].strip()
+                if name:
+                    builtin_names.add(name)
+
+    # Walk skills directory
+    if HERMES_SKILLS_DIR.exists():
+        for item in sorted(HERMES_SKILLS_DIR.iterdir()):
+            if item.name.startswith(".") or item.name == "__pycache__":
+                continue
+            if item.is_dir():
+                # Could be a category dir or a flat skill dir
+                skill_md = item / "SKILL.md"
+                if skill_md.exists():
+                    # Flat skill (e.g., dogfood, yuanbao)
+                    desc = extract_skill_description(skill_md)
+                    skills.append({
+                        "name": item.name,
+                        "description": desc,
+                        "source": "builtin" if item.name in builtin_names else "local"
+                    })
+                else:
+                    # Category directory
+                    for sub in sorted(item.iterdir()):
+                        if sub.is_dir() and (sub / "SKILL.md").exists():
+                            desc = extract_skill_description(sub / "SKILL.md")
+                            skills.append({
+                                "name": sub.name,
+                                "description": desc,
+                                "source": "builtin" if sub.name in builtin_names else "local"
+                            })
+    return skills
+
+def extract_skill_description(skill_md_path: Path) -> str:
+    try:
+        content = skill_md_path.read_text(encoding="utf-8", errors="replace")
+        for line in content.splitlines():
+            if line.strip() and not line.startswith("#") and not line.startswith("---") and not line.startswith("name:") and not line.startswith("category:"):
+                return line.strip()[:120]
+        return ""
+    except Exception:
+        return ""
+
+def skills_grouped_by_category() -> dict:
+    """Returns {category: [{name, description, source}, ...]}"""
+    all_skills = list_all_skills()
+    # Determine category from directory structure
+    result = OrderedDict()
+    if HERMES_SKILLS_DIR.exists():
+        for item in sorted(HERMES_SKILLS_DIR.iterdir()):
+            if item.name.startswith(".") or item.name == "__pycache__":
+                continue
+            if item.is_dir():
+                skill_md = item / "SKILL.md"
+                if skill_md.exists():
+                    # Flat skill — use "other" category
+                    cat = "other"
+                    s = next((x for x in all_skills if x["name"] == item.name), None)
+                    if s:
+                        result.setdefault(cat, []).append(s)
+                else:
+                    # Category dir
+                    cat = item.name
+                    for sub in sorted(item.iterdir()):
+                        if sub.is_dir() and (sub / "SKILL.md").exists():
+                            s = next((x for x in all_skills if x["name"] == sub.name), None)
+                            if s:
+                                result.setdefault(cat, []).append(s)
+    return result
+
+# ─── Model listing ────────────────────────────────────
+
+OLLAMA_LOCAL_URL = "http://192.168.0.187:11434"
+
+def list_models() -> dict:
+    """Fetch available models from Ollama local + cloud defaults."""
+    models = []
+
+    # 1. Local Ollama
+    try:
+        r = _requests.get(f"{OLLAMA_LOCAL_URL}/api/tags", timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            for m in data.get("models", []):
+                name = m.get("name", "")
+                if name.endswith(":latest"):
+                    name = name.replace(":latest", "")
+                models.append({
+                    "id": m.get("name", ""),
+                    "name": name,
+                    "size": m.get("size", 0),
+                    "modified_at": m.get("modified_at", ""),
+                    "source": "local"
+                })
+    except Exception:
+        pass
+
+    # 2. Cloud defaults
+    cloud_defaults = [
+        {"id": "kimi-k2.6", "name": "kimi-k2.6", "size": None, "source": "cloud"},
+        {"id": "glm-5.2", "name": "glm-5.2", "size": None, "source": "cloud"},
+        {"id": "deepseek-v4-pro", "name": "deepseek-v4-pro", "size": None, "source": "cloud"},
+        {"id": "qwen3-coder:480b", "name": "qwen3-coder 480b", "size": None, "source": "cloud"},
+    ]
+    for cm in cloud_defaults:
+        if cm["id"] not in [m["id"] for m in models]:
+            models.append(cm)
+
+    # Get default model from hermes config
+    default_model = os.environ.get("HERMES_MODEL", "kimi-k2.6")
+    return {"models": models, "default": default_model}
+
+# ─── History ──────────────────────────────────────────
+
+HISTORY_FILE = DATA_DIR / "history.json"
+
+def load_history() -> list:
+    if HISTORY_FILE.exists():
+        try:
+            return json.loads(HISTORY_FILE.read_text())
+        except Exception:
+            pass
+    return []
+
+def save_history_entry(entry: dict):
+    h = load_history()
+    h.append(entry)
+    HISTORY_FILE.write_text(json.dumps(h, indent=2, ensure_ascii=False))
+
+# ─── Orchestrator state ───────────────────────────────
+
+ORCH_INBOX_FILE = DATA_DIR / "orchestrator_inbox.json"
+ORCH_STATE_FILE = DATA_DIR / "orchestrator_state.json"
+ORCH_MODE_FILE = DATA_DIR / "orchestrator_mode.json"
+ORCH_STATUS_CACHE = {"online": False, "mode": "brainstorm"}
+
+def load_orch_inbox() -> list:
+    if ORCH_INBOX_FILE.exists():
+        try:
+            return json.loads(ORCH_INBOX_FILE.read_text())
+        except Exception:
+            pass
+    return []
+
+def save_orch_inbox(inbox: list):
+    ORCH_INBOX_FILE.write_text(json.dumps(inbox, indent=2), encoding="utf-8")
+
+def load_orch_state() -> dict:
+    if ORCH_STATE_FILE.exists():
+        try:
+            return json.loads(ORCH_STATE_FILE.read_text())
+        except Exception:
+            pass
+    return {"last_processed": 0, "processing": False}
+
+def save_orch_state(state: dict):
+    ORCH_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+# ─── Cron Tasks ───────────────────────────────────────
+
+CRON_FILE = DATA_DIR / "cron_tasks.json"
+
+def load_cron_tasks() -> list:
+    if CRON_FILE.exists():
+        try:
+            return json.loads(CRON_FILE.read_text())
+        except Exception:
+            pass
+    return []
+
+def save_cron_tasks(tasks: list):
+    CRON_FILE.write_text(json.dumps(tasks, indent=2, ensure_ascii=False), encoding="utf-8")
+
+# ─── Windows resources ────────────────────────────────
+
 windows_resources = {}
+WINDOWS_RES_FILE = DATA_DIR / "windows_resources.json"
 
-# ─── Orchestrator status cache ─────────────────────
-orchestrator_status_cache = {"status": "offline", "mode": "brainstorm"}
+def load_windows_resources() -> dict:
+    if WINDOWS_RES_FILE.exists():
+        try:
+            return json.loads(WINDOWS_RES_FILE.read_text())
+        except Exception:
+            pass
+    return {}
 
-# ─── REST API Routes ───────────────────────────────
+# ─── Media temp ───────────────────────────────────────
+
+MEDIA_TEMP_DIR = project_root / "temp"
+MEDIA_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+# Clean temp on startup
+for f in MEDIA_TEMP_DIR.iterdir():
+    try:
+        f.unlink()
+    except Exception:
+        pass
+
+# ─── REST API Routes ──────────────────────────────────
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "socket_io": True, "version": "3.0.0"})
+
+@app.route("/")
+def index():
+    return send_from_directory(app.static_folder, "index.html")
+
+@app.route("/<path:path>")
+def static_files(path):
+    full = app.static_folder / path
+    if full.exists():
+        return send_from_directory(app.static_folder, path)
+    return send_from_directory(app.static_folder, "index.html")
+
+# ── Agents ──
 
 @app.route("/api/agents")
 def api_list_agents():
     profile = request.args.get("profile")
     status = request.args.get("status")
-    return jsonify(list_agents(profile_filter=profile, status_filter=status))
+    try:
+        return jsonify(list_agents(profile_filter=profile, status_filter=status))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/agents/launch", methods=["POST"])
 def api_launch_agent():
     data = request.json or {}
-    profile = data.get("profile", "researcher")
-    goal = data.get("goal", "No goal specified")
-    prompt = data.get("prompt", goal)
-
-    valid_profiles = ["researcher", "developer", "multimedia", "wiki"]
-    if profile not in valid_profiles:
-        return jsonify({"error": f"Invalid profile. Use: {valid_profiles}"}), 400
-
-    agent_id = f"{profile}_{uuid.uuid4().hex[:8]}"
-    task_file = Path(__file__).parent / "data" / f"{agent_id}_task.json"
-    task_file.parent.mkdir(parents=True, exist_ok=True)
-    task_data = {
-        "id": agent_id,
-        "profile": profile,
-        "goal": goal,
-        "prompt": prompt,
-        "context": data.get("context", ""),
-        "timeout_seconds": data.get("timeout_seconds", 1200)
-    }
-    with open(task_file, 'w', encoding='utf-8') as f:
-        json.dump(task_data, f, indent=2)
-
-    register_agent(agent_id, profile, goal, f"python3 profiles/run_{profile}.py {agent_id}")
-    agent = launch_agent(profile, goal, prompt, agent_id=agent_id)
-    return jsonify(agent)
-
-@app.route("/api/agents/<agent_id>/output")
-def api_agent_output(agent_id):
-    lines = request.args.get("lines", 100, type=int)
-    output = get_agent_output(agent_id, lines=lines)
-    return jsonify({"agent_id": agent_id, "output": output})
-
-@app.route("/api/agents/<agent_id>/kill", methods=["POST"])
-def api_kill_agent(agent_id):
-    success = kill_agent(agent_id)
-    if success:
-        return jsonify({"success": True, "message": f"Agent {agent_id} terminado"})
-    return jsonify({"success": False, "error": "Failed to kill agent"}), 500
-
-@app.route("/api/agents/<agent_id>")
-def api_get_agent(agent_id):
-    agent = get_agent(agent_id)
-    if agent:
-        return jsonify(agent)
-    return jsonify({"error": "Agent not found"}), 404
-
-# ─── Socket.IO Events ──────────────────────────────
-
-@socketio.on('connect')
-def handle_connect():
-    emit('connected', {'status': 'ok', 'agents': list_agents()})
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    pass
-
-@socketio.on('launch_agent')
-def handle_launch(data):
-    profile = data.get('profile', 'researcher')
-    goal = data.get('goal', 'No goal specified')
-    prompt = data.get('prompt', goal)
-
-    valid_profiles = ['researcher', 'developer', 'multimedia', 'wiki']
-    if profile not in valid_profiles:
-        emit('error', {'message': f'Invalid profile. Use: {valid_profiles}'})
-        return
-
-    agent_id = f"{profile}_{uuid.uuid4().hex[:8]}"
-    task_file = Path(__file__).parent / "data" / f"{agent_id}_task.json"
-    task_file.parent.mkdir(parents=True, exist_ok=True)
-    task_data = {
-        "id": agent_id, "profile": profile, "goal": goal,
-        "prompt": prompt, "context": data.get('context', ''),
-        "timeout_seconds": data.get('timeout_seconds', 1200)
-    }
-    with open(task_file, 'w', encoding='utf-8') as f:
-        json.dump(task_data, f, indent=2)
-
-    register_agent(agent_id, profile, goal, f"python3 profiles/run_{profile}.py {agent_id}")
-    agent = launch_agent(profile, goal, prompt, agent_id=agent_id)
-    emit('agent_launched', agent)
-    broadcast_agents()
-
-@socketio.on('kill_agent')
-def handle_kill(data):
-    agent_id = data.get('agent_id')
-    success = kill_agent(agent_id)
-    emit('agent_killed', {'agent_id': agent_id, 'success': success})
-    broadcast_agents()
-
-@socketio.on('get_output')
-def handle_get_output(data):
-    agent_id = data.get('agent_id')
-    lines = data.get('lines', 100)
-    output = get_agent_output(agent_id, lines=lines)
-    emit('agent_output', {'agent_id': agent_id, 'output': output})
-
-@socketio.on('send_input')
-def handle_send_input(data):
-    agent_id = data.get('agent_id')
-    text = data.get('text', '')
-    success = send_keys_to_agent(agent_id, text)
-    emit('input_sent', {'agent_id': agent_id, 'success': success})
-
-@socketio.on('refresh_agents')
-def handle_refresh():
-    emit('agents_list', list_agents())
-
-@socketio.on('dispatch_task')
-def handle_dispatch_task(data):
-    """Receives task dispatch from AgentPanel and launches the agent."""
-    profile = data.get('target_profile', 'unknown')
-    task = data.get('task', '')
-
-    # Map frontend agent IDs to profile names
-    profile_map = {
-        'dev': 'developer',
-        'mm': 'multimedia',
-        'res': 'researcher',
-        'wiki': 'wiki'
-    }
-    if profile in profile_map:
-        profile = profile_map[profile]
-
-    valid_profiles = ['researcher', 'developer', 'multimedia', 'wiki']
-    if profile not in valid_profiles:
-        emit('error', {'message': f'Invalid profile. Use: {valid_profiles}'})
-        return
-
-    if not task or not task.strip():
-        emit('error', {'message': 'Task description cannot be empty'})
-        return
-
-    timestamp = datetime.now().isoformat()
-    agent_id = f"{profile}_{uuid.uuid4().hex[:8]}"
-
-    # Create task file
-    task_file = Path(__file__).parent / "data" / f"{agent_id}_task.json"
-    task_file.parent.mkdir(parents=True, exist_ok=True)
-    task_data = {
-        "id": agent_id, "profile": profile, "goal": task,
-        "prompt": task, "context": data.get('context', ''),
-        "timeout_seconds": data.get('timeout_seconds', 1200)
-    }
-    with open(task_file, 'w', encoding='utf-8') as f:
-        json.dump(task_data, f, indent=2)
-
-    # Register and launch via tmux
-    register_agent(agent_id, profile, task, f"python3 profiles/run_{profile}.py {agent_id}")
-    agent = launch_agent(profile, task, task, agent_id=agent_id)
-
-    entry = {
-        'id': agent_id,
-        'profile': profile,
-        'task': task,
-        'status': 'running',
-        'time': timestamp
-    }
-    # Persist to history file
-    history_file = Path(__file__).parent / "data" / "history.json"
-    history_file.parent.mkdir(parents=True, exist_ok=True)
-    history = []
-    if history_file.exists():
-        try:
-            with open(history_file, 'r', encoding='utf-8') as f:
-                history = json.load(f)
-        except Exception:
-            history = []
-    history.insert(0, entry)
-    with open(history_file, 'w', encoding='utf-8') as f:
-        json.dump(history, f, indent=2)
-    emit('task_dispatched', entry)
-    broadcast_agents()
-
-@socketio.on('orchestrator_message')
-def handle_orchestrator_message(data):
-    """Receives chat message from dashboard, broadcasts typing indicator."""
-    text = data.get('text', '')
-    if not text:
-        return
-    # Store in inbox for potential external processing
-    inbox_file = Path(__file__).parent / "data" / "orchestrator_inbox.json"
-    inbox_file.parent.mkdir(parents=True, exist_ok=True)
-    inbox = []
-    if inbox_file.exists():
-        try:
-            with open(inbox_file, 'r', encoding='utf-8') as f:
-                inbox = json.load(f)
-        except Exception:
-            inbox = []
-    inbox.append({'role': 'user', 'text': text, 'time': datetime.now().isoformat()})
-    with open(inbox_file, 'w', encoding='utf-8') as f:
-        json.dump(inbox, f, indent=2)
-    # Broadcast typing indicator to all clients
-    socketio.emit('orchestrator_typing', {})
-    # Also broadcast the message so agent can pick it up
-    socketio.emit('orchestrator_message', {'text': text})
-    emit('message_received', {'status': 'ok'})
-
-@socketio.on('orchestrator_mode_change')
-def handle_mode_change(data):
-    """Receives mode change request from frontend, broadcasts to agent."""
-    mode = data.get('mode', 'brainstorm')
-    # Persist mode
-    mode_file = Path(__file__).parent / "data" / "orchestrator_mode.json"
-    mode_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(mode_file, 'w', encoding='utf-8') as f:
-        json.dump({'mode': mode}, f)
-    socketio.emit('orchestrator_mode_change', {'mode': mode})
-    emit('mode_changed', {'mode': mode})
-
-@socketio.on('orchestrator_summarize')
-def handle_summarize(data):
-    """Receives summarize request from frontend, broadcasts to agent."""
-    socketio.emit('orchestrator_summarize', data)
-    emit('summarize_triggered', {'status': 'ok'})
-
-@socketio.on('orchestrator_ready')
-def handle_orchestrator_ready(data):
-    """Agent notifies it's ready."""
-    global orchestrator_status_cache
-    print(f"[INFO] Orchestrator agent ready: {data}")
-    orchestrator_status_cache = {"status": "online", "mode": data.get("mode", "brainstorm")}
-    socketio.emit('orchestrator_status', orchestrator_status_cache)
-
-@socketio.on('orchestrator_response')
-def handle_orchestrator_response_socket(data):
-    """Agent emits response via Socket.IO — rebroadcast to all clients."""
-    global orchestrator_status_cache
-    text = data.get('text', '')
-    mode = data.get('mode', '')
-    if text:
-        orchestrator_status_cache["status"] = "online"
-        if mode:
-            orchestrator_status_cache["mode"] = mode
-        socketio.emit('orchestrator_response', {'text': text, 'mode': mode})
-
-@socketio.on('orchestrator_typing')
-def handle_orchestrator_typing_socket(data):
-    """Agent emits typing indicator — rebroadcast to all clients."""
-    global orchestrator_status_cache
-    orchestrator_status_cache["status"] = "online"
-    socketio.emit('orchestrator_typing', {})
-
-@socketio.on('orchestrator_status')
-def handle_orchestrator_status(data):
-    """Handle status from agent."""
-    global orchestrator_status_cache
-    if data and data.get("status"):
-        orchestrator_status_cache = data
-        socketio.emit('orchestrator_status', orchestrator_status_cache)
-
-# ─── REST API for orchestrator responses ─────────
-
-@app.route("/api/orchestrator/response", methods=["POST"])
-def api_orchestrator_response():
-    """External systems (Hermes TUI) can POST responses here."""
-    data = request.json or {}
-    text = data.get("text", "")
-    profile = data.get("profile", None)
-    if not text:
-        return jsonify({"error": "Missing text"}), 400
-    socketio.emit('orchestrator_response', {'text': text, 'profile': profile})
-    return jsonify({"success": True})
-
-@app.route("/api/history")
-def api_history():
-    """Return task history."""
-    history_file = Path(__file__).parent / "data" / "history.json"
-    history = []
-    if history_file.exists():
-        try:
-            with open(history_file, 'r', encoding='utf-8') as f:
-                history = json.load(f)
-        except Exception:
-            history = []
-    return jsonify(history)
-
-@app.route("/api/orchestrator/inbox")
-def api_orchestrator_inbox():
-    """Return unread orchestrator messages."""
-    inbox_file = Path(__file__).parent / "data" / "orchestrator_inbox.json"
-    inbox = []
-    if inbox_file.exists():
-        try:
-            with open(inbox_file, 'r', encoding='utf-8') as f:
-                inbox = json.load(f)
-        except Exception:
-            inbox = []
-    return jsonify(inbox)
-
-def broadcast_agents():
-    agents = list_agents()
-    socketio.emit('agents_updated', {'agents': agents})
-
-# ─── Background sync thread ─────────────────────────
-def sync_worker():
-    while True:
-        time.sleep(5)
-        try:
-            sync_running_agents()
-            cleanup_old_agents(max_age_hours=24)
-            broadcast_agents()
-        except Exception:
-            pass
-
-sync_thread = threading.Thread(target=sync_worker, daemon=True)
-sync_thread.start()
-
-# ─── Resource monitoring thread ────────────────────
-NVIDIA_SMI_AVAILABLE = shutil.which('nvidia-smi') is not None
-
-def get_gpu_info():
-    if not NVIDIA_SMI_AVAILABLE:
-        return None
+    profile = data.get("profile", "developer")
+    goal = data.get("goal", "")
+    model = data.get("model")
+    agent_id = data.get("id", f"{profile}_{uuid.uuid4().hex[:8]}")
     try:
-        import subprocess
-        result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=name,memory.used,memory.total,utilization.gpu',
-             '--format=csv,noheader,nounits'],
-            capture_output=True, text=True, timeout=2
-        )
-        if result.returncode == 0:
-            parts = result.stdout.strip().split(', ')
-            if len(parts) == 4:
-                return {
-                    'name': parts[0],
-                    'vram_used_mb': int(parts[1]),
-                    'vram_total_mb': int(parts[2]),
-                    'gpu_percent': int(parts[3])
-                }
-    except Exception:
-        pass
-    return None
-
-def get_system_resources():
-    cpu_perc = psutil.cpu_percent(interval=None)
-    cpu_freq = psutil.cpu_freq()
-    ram = psutil.virtual_memory()
-    disk = psutil.disk_usage('/')
-    
-    resources = {
-        'cpu': {
-            'percent': round(cpu_perc, 1),
-            'cores': psutil.cpu_count(logical=True),
-            'freq_mhz': round(cpu_freq.current, 0) if cpu_freq else 0
-        },
-        'ram': {
-            'used_gb': round(ram.used / (1024**3), 1),
-            'total_gb': round(ram.total / (1024**3), 1),
-            'percent': ram.percent
-        },
-        'disk': {
-            'used_gb': round(disk.used / (1024**3), 1),
-            'total_gb': round(disk.total / (1024**3), 1),
-            'percent': round(disk.percent, 1)
-        },
-        'gpu': get_gpu_info()
-    }
-    return resources
-
-def resource_worker():
-    while True:
-        time.sleep(2)
-        try:
-            vm_resources = get_system_resources()
-            combined = {
-                'vm': vm_resources,
-                'windows': windows_resources if windows_resources else None,
-                'timestamp': time.time()
-            }
-            socketio.emit('resources_update', combined)
-        except Exception:
-            pass
-
-resource_thread = threading.Thread(target=resource_worker, daemon=True)
-resource_thread.start()
-
-# ─── Orchestrator bridge poll thread ───────────────
-orchestrator_state = {
-    'last_processed': 0,
-    'processing': False
-}
-
-# ─── Cron Tasks ────────────────────────────────────
-CRON_FILE = Path(__file__).parent / "data" / "cron_tasks.json"
-CRON_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-def load_cron_tasks() -> list:
-    if not CRON_FILE.exists():
-        return []
-    try:
-        with open(CRON_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception:
-        return []
-
-def save_cron_tasks(tasks: list):
-    with open(CRON_FILE, 'w', encoding='utf-8') as f:
-        json.dump(tasks, f, indent=2, ensure_ascii=False)
-
-@socketio.on('add_cron_task')
-def handle_add_cron_task(data):
-    """Add a new scheduled cron task."""
-    profile = data.get('profile', 'researcher')
-    valid_profiles = ['researcher', 'developer', 'multimedia', 'wiki']
-    if profile not in valid_profiles:
-        emit('error', {'message': f'Invalid profile. Use: {valid_profiles}'})
-        return
-
-    task_text = (data.get('task', '') or '').strip()
-    if not task_text:
-        emit('error', {'message': 'Task description cannot be empty'})
-        return
-
-    hour = data.get('hour', 0)
-    minute = data.get('minute', 0)
-    days = data.get('days', [])  # [0,1,2,3,4,5,6] where 0=Monday
-    repeat_type = data.get('repeat_type', 'times')  # 'times' | 'infinite'
-    repeat_count = data.get('repeat_count', 1)
-
-    entry = {
-        'id': str(uuid.uuid4())[:12],
-        'profile': profile,
-        'task': task_text,
-        'hour': hour,
-        'minute': minute,
-        'days': days,
-        'repeat_type': repeat_type,
-        'repeat_count': repeat_count,
-        'runs_done': 0,
-        'enabled': True,
-        'created_at': datetime.now().isoformat()
-    }
-    tasks = load_cron_tasks()
-    tasks.append(entry)
-    save_cron_tasks(tasks)
-    emit('cron_task_added', entry)
-    socketio.emit('cron_tasks_update', {'tasks': tasks})
-
-@socketio.on('remove_cron_task')
-def handle_remove_cron_task(data):
-    task_id = data.get('id', '')
-    tasks = load_cron_tasks()
-    tasks = [t for t in tasks if t['id'] != task_id]
-    save_cron_tasks(tasks)
-    emit('cron_task_removed', {'id': task_id})
-    socketio.emit('cron_tasks_update', {'tasks': tasks})
-
-@socketio.on('toggle_cron_task')
-def handle_toggle_cron_task(data):
-    task_id = data.get('id', '')
-    enabled = data.get('enabled', True)
-    tasks = load_cron_tasks()
-    for t in tasks:
-        if t['id'] == task_id:
-            t['enabled'] = enabled
-            break
-    save_cron_tasks(tasks)
-    emit('cron_task_toggled', {'id': task_id, 'enabled': enabled})
-    socketio.emit('cron_tasks_update', {'tasks': tasks})
-
-@socketio.on('list_cron_tasks')
-def handle_list_cron_tasks():
-    emit('cron_tasks_update', {'tasks': load_cron_tasks()})
-
-@app.route("/api/cron/tasks", methods=["GET", "POST"])
-def api_cron_tasks():
-    if request.method == "POST":
-        data = request.json or {}
-        profile = data.get('profile', 'researcher')
-        task_text = (data.get('task', '') or '').strip()
-        if not task_text:
-            return jsonify({"error": "Task description cannot be empty"}), 400
-        entry = {
-            'id': str(uuid.uuid4())[:12],
-            'profile': profile,
-            'task': task_text,
-            'hour': data.get('hour', 0),
-            'minute': data.get('minute', 0),
-            'days': data.get('days', []),
-            'repeat_type': data.get('repeat_type', 'times'),
-            'repeat_count': data.get('repeat_count', 1),
-            'runs_done': 0,
-            'enabled': True,
-            'created_at': datetime.now().isoformat()
-        }
-        tasks = load_cron_tasks()
-        tasks.append(entry)
-        save_cron_tasks(tasks)
-        return jsonify(entry)
-    return jsonify(load_cron_tasks())
-
-@app.route("/api/cron/tasks/<task_id>", methods=["DELETE", "PATCH"])
-def api_cron_task(task_id):
-    tasks = load_cron_tasks()
-    if request.method == "DELETE":
-        tasks = [t for t in tasks if t['id'] != task_id]
-        save_cron_tasks(tasks)
-        return jsonify({"success": True})
-    if request.method == "PATCH":
-        data = request.json or {}
-        for t in tasks:
-            if t['id'] == task_id:
-                if 'enabled' in data:
-                    t['enabled'] = data['enabled']
-                break
-        save_cron_tasks(tasks)
-        return jsonify(tasks)
-    return jsonify({"error": "Method not allowed"}), 405
-
-def should_run_now(task: dict) -> bool:
-    """Check if a cron task should execute right now."""
-    if not task.get('enabled', True):
-        return False
-    now = datetime.now()
-    if now.hour != task.get('hour', 0):
-        return False
-    if now.minute != task.get('minute', 0):
-        return False
-    days = task.get('days', [])
-    if days and now.weekday() not in days:
-        return False
-    repeat_type = task.get('repeat_type', 'times')
-    if repeat_type == 'times':
-        if task.get('runs_done', 0) >= task.get('repeat_count', 1):
-            return False
-    return True
-
-def cron_scheduler_worker():
-    """Run every 60 seconds and execute due cron tasks."""
-    last_minute = -1
-    while True:
-        time.sleep(30)
-        now = datetime.now()
-        current_minute = now.hour * 60 + now.minute
-        if current_minute == last_minute:
-            continue
-        last_minute = current_minute
-
-        tasks = load_cron_tasks()
-        ran_any = False
-        for task in tasks:
-            if should_run_now(task):
-                profile = task['profile']
-                task_text = task['task']
-                agent_id = f"{profile}_{uuid.uuid4().hex[:8]}"
-
-                task_file = Path(__file__).parent / "data" / f"{agent_id}_task.json"
-                task_file.parent.mkdir(parents=True, exist_ok=True)
-                task_data = {
-                    "id": agent_id, "profile": profile, "goal": task_text,
-                    "prompt": task_text, "context": "", "timeout_seconds": 1200
-                }
-                with open(task_file, 'w', encoding='utf-8') as f:
-                    json.dump(task_data, f, indent=2)
-
-                register_agent(agent_id, profile, task_text,
-                               f"python3 profiles/run_{profile}.py {agent_id}")
-                launch_agent(profile, task_text, task_text, agent_id=agent_id)
-
-                task['runs_done'] = task.get('runs_done', 0) + 1
-                if task.get('repeat_type') == 'times' and task['runs_done'] >= task.get('repeat_count', 1):
-                    task['enabled'] = False
-
-                # Add to history
-                history_file = Path(__file__).parent / "data" / "history.json"
-                history = []
-                if history_file.exists():
-                    try:
-                        with open(history_file, 'r', encoding='utf-8') as f:
-                            history = json.load(f)
-                    except Exception:
-                        history = []
-                history.insert(0, {
-                    'id': agent_id, 'profile': profile, 'task': task_text,
-                    'status': 'running', 'time': now.isoformat()
-                })
-                with open(history_file, 'w', encoding='utf-8') as f:
-                    json.dump(history, f, indent=2)
-
-                socketio.emit('cron_task_executed', {
-                    'cron_id': task['id'],
-                    'agent_id': agent_id,
-                    'profile': profile,
-                    'task': task_text
-                })
-                ran_any = True
-
-        if ran_any:
-            save_cron_tasks(tasks)
-            socketio.emit('cron_tasks_update', {'tasks': tasks})
-            broadcast_agents()
-
-cron_thread = threading.Thread(target=cron_scheduler_worker, daemon=True)
-cron_thread.start()
-
-# ─── Launch Orchestrator Agent subprocess ────────────
-_orchestrator_process = None
-
-def start_orchestrator_agent():
-    """Inicia o orchestrator_agent.py como subprocesso independente."""
-    global _orchestrator_process
-    agent_script = Path(__file__).parent / "orchestrator_agent.py"
-    if not agent_script.exists():
-        print("[WARN] orchestrator_agent.py não encontrado. Orquestrador offline.")
-        return
-    
-    venv_python = Path.home() / "venv_agentgui" / "bin" / "python"
-    if not venv_python.exists():
-        venv_python = Path("/usr/bin/python3")
-    
-    try:
-        env = os.environ.copy()
-        # Carregar API keys do ~/.hermes/.env se não estiverem no ambiente
-        hermes_env = Path.home() / ".hermes" / ".env"
-        if hermes_env.exists():
-            try:
-                with open(hermes_env, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith('#') and '=' in line:
-                            key, val = line.split('=', 1)
-                            if key not in env:
-                                env[key] = val
-            except Exception:
-                pass
-        # Log file for orchestrator agent
-        log_file = Path("/tmp/orchestrator_agent.log")
-        log_file.write_text(f"[{datetime.now().isoformat()}] Orchestrator Agent starting...\n")
-        _orchestrator_process = subprocess.Popen(
-            [str(venv_python), str(agent_script)],
-            stdout=open(str(log_file), 'a'),
-            stderr=subprocess.STDOUT,
-            cwd=str(Path(__file__).parent),
-            env=env,
-            text=True
-        )
-        print(f"[OK] Orchestrator Agent iniciado (PID {_orchestrator_process.pid})")
-        print(f"[INFO] Logs do agente em: {log_file}")
-    except Exception as e:
-        print(f"[ERROR] Falha a iniciar orchestrator_agent.py: {e}")
-
-def stop_orchestrator_agent():
-    global _orchestrator_process
-    if _orchestrator_process:
-        _orchestrator_process.terminate()
-        try:
-            _orchestrator_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            _orchestrator_process.kill()
-        print("[INFO] Orchestrator Agent terminado.")
-        _orchestrator_process = None
-
-def bridge_poll_worker():
-    """Polls orchestrator inbox and notifies when new messages arrive."""
-    inbox_file = Path(__file__).parent / "data" / "orchestrator_inbox.json"
-    state_file = Path(__file__).parent / "data" / "orchestrator_state.json"
-    while True:
-        time.sleep(3)
-        try:
-            # Load current state
-            if state_file.exists():
-                try:
-                    with open(state_file, 'r', encoding='utf-8') as f:
-                        orchestrator_state.update(json.load(f))
-                except Exception:
-                    pass
-            
-            # Check inbox
-            if not inbox_file.exists():
-                continue
-            
-            with open(inbox_file, 'r', encoding='utf-8') as f:
-                inbox = json.load(f)
-            
-            if not inbox:
-                continue
-            
-            last_idx = orchestrator_state.get('last_processed', 0)
-            new_count = len(inbox) - last_idx
-            
-            if new_count > 0:
-                # Process each new message
-                for msg in inbox[last_idx:]:
-                    text = msg.get('text', '')
-                    # Broadcast to all connected clients that a message needs response
-                    socketio.emit('orchestrator_needs_response', {
-                        'text': text,
-                        'time': msg.get('time', '')
-                    })
-                
-                orchestrator_state['last_processed'] = len(inbox)
-                with open(state_file, 'w', encoding='utf-8') as f:
-                    json.dump(orchestrator_state, f, indent=2)
-        except Exception:
-            pass
-
-bridge_thread = threading.Thread(target=bridge_poll_worker, daemon=True)
-bridge_thread.start()
-
-# ─── REST API to mark inbox processed ──────────────
-@app.route("/api/orchestrator/mark_processed", methods=["POST"])
-def api_mark_processed():
-    """Mark inbox as fully processed (clear unread)."""
-    state_file = Path(__file__).parent / "data" / "orchestrator_state.json"
-    inbox_file = Path(__file__).parent / "data" / "orchestrator_inbox.json"
-    try:
-        if inbox_file.exists():
-            with open(inbox_file, 'r', encoding='utf-8') as f:
-                inbox = json.load(f)
-            count = len(inbox)
-        else:
-            count = 0
-        state = {'last_processed': count, 'processing': False}
-        with open(state_file, 'w', encoding='utf-8') as f:
-            json.dump(state, f, indent=2)
-        return jsonify({"success": True, "marked_count": count})
+        register_agent(agent_id, profile, goal, "")
+        result = launch_agent(profile, goal, "", agent_id=agent_id, model=model)
+        return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/agents/<agent_id>/output")
+def api_agent_output(agent_id):
+    lines = int(request.args.get("lines", 100))
+    try:
+        return jsonify({"output": get_agent_output(agent_id, lines)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/agents/<agent_id>/kill", methods=["POST"])
+def api_kill_agent(agent_id):
+    try:
+        kill_agent(agent_id)
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/agents/delete_finished", methods=["POST"])
+def api_delete_finished():
+    try:
+        count = delete_finished_agents()
+        return jsonify({"deleted": count})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ── History ──
+
+@app.route("/api/history")
+def api_history():
+    return jsonify(load_history())
+
+# ── Models (real listing) ──
+
+@app.route("/api/models")
+def api_models():
+    return jsonify(list_models())
+
+# ── Skills ──
+
+@app.route("/api/skills")
+def api_skills():
+    profile = request.args.get("profile")
+    cats = skills_grouped_by_category()
+    return jsonify({"categories": cats})
+
+@app.route("/api/profiles/<profile_id>/skills-config", methods=["GET", "POST"])
+def api_skills_config(profile_id):
+    if request.method == "GET":
+        return jsonify(load_skills_config(profile_id))
+    else:
+        config = request.json or {}
+        save_skills_config(profile_id, config)
+        return jsonify({"success": True})
+
+# ── Profile config (model selection — REAL) ──
+
+@app.route("/api/profiles/<profile_id>/config", methods=["GET", "POST"])
+def api_profile_config(profile_id):
+    if request.method == "GET":
+        return jsonify(load_profile_config(profile_id))
+    else:
+        config = request.json or {}
+        save_profile_config(profile_id, config)
+        return jsonify({"success": True})
+
+# ── Orchestrator ──
+
+@app.route("/api/orchestrator/inbox")
+def api_orch_inbox():
+    return jsonify(load_orch_inbox())
+
+@app.route("/api/orchestrator/response", methods=["POST"])
+def api_orch_response():
+    data = request.json or {}
+    text = data.get("text", "")
+    profile = data.get("profile")
+    socketio.emit("orchestrator_response", {"text": text, "profile": profile})
+    return jsonify({"success": True})
+
+@app.route("/api/orchestrator/mark_processed", methods=["POST"])
+def api_orch_mark_processed():
+    data = request.json or {}
+    count = data.get("count", 0)
+    state = load_orch_state()
+    state["last_processed"] = count
+    save_orch_state(state)
+    return jsonify({"success": True})
+
 @app.route("/api/orchestrator/state")
-def api_orchestrator_state():
-    """Return orchestrator state (last_processed, processing)."""
-    state_file = Path(__file__).parent / "data" / "orchestrator_state.json"
-    state = {'last_processed': 0, 'processing': False}
-    if state_file.exists():
+def api_orch_state():
+    return jsonify(load_orch_state())
+
+@app.route("/api/orchestrator/status")
+def api_orch_status():
+    mode = "brainstorm"
+    if ORCH_MODE_FILE.exists():
         try:
-            with open(state_file, 'r', encoding='utf-8') as f:
-                state = json.load(f)
+            mode = json.loads(ORCH_MODE_FILE.read_text()).get("mode", "brainstorm")
         except Exception:
             pass
-    return jsonify(state)
-@app.route("/api/orchestrator/status")
-def api_orchestrator_status():
-    """Return orchestrator cached status (online/offline, mode)."""
-    return jsonify(orchestrator_status_cache)
+    # Also load current model from config
+    orch_config = load_profile_config("orchestrator")
+    return jsonify({
+        "online": ORCH_STATUS_CACHE["online"],
+        "mode": ORCH_STATUS_CACHE.get("mode", mode),
+        "model": orch_config.get("model")
+    })
 
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
-def serve_react(path):
-    static_path = Path(__file__).parent / 'static'
-    if path and (static_path / path).exists():
-        return send_from_directory(static_path, path)
-    return send_from_directory(static_path, 'index.html')
+# ── Cron Tasks ──
 
-# ─── Health Check ──────────────────────────────────
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok", "socket_io": True, "version": "2.0.0"})
+@app.route("/api/cron/tasks")
+def api_cron_list():
+    return jsonify(load_cron_tasks())
 
-# ─── Windows Resource Receiver ─────────────────────
+@app.route("/api/cron/tasks", methods=["POST"])
+def api_cron_add():
+    data = request.json or {}
+    tasks = load_cron_tasks()
+    task = {
+        "id": uuid.uuid4().hex[:8],
+        "profile": data.get("profile", "researcher"),
+        "task": data.get("task", ""),
+        "hour": int(data.get("hour", 12)),
+        "minute": int(data.get("minute", 0)),
+        "days": data.get("days", [0,1,2,3,4]),
+        "repeat_type": data.get("repeat_type", "infinite"),
+        "repeat_count": int(data.get("repeat_count", 1)),
+        "runs_done": 0,
+        "enabled": True,
+        "created_at": datetime.now().isoformat()
+    }
+    tasks.append(task)
+    save_cron_tasks(tasks)
+    socketio.emit("cron_task_added", task)
+    return jsonify(task)
+
+@app.route("/api/cron/tasks/<task_id>", methods=["DELETE"])
+def api_cron_delete(task_id):
+    tasks = load_cron_tasks()
+    tasks = [t for t in tasks if t["id"] != task_id]
+    save_cron_tasks(tasks)
+    socketio.emit("cron_task_removed", {"id": task_id})
+    return jsonify({"success": True})
+
+@app.route("/api/cron/tasks/<task_id>", methods=["PATCH"])
+def api_cron_toggle(task_id):
+    tasks = load_cron_tasks()
+    for t in tasks:
+        if t["id"] == task_id:
+            t["enabled"] = not t.get("enabled", True)
+            save_cron_tasks(tasks)
+            socketio.emit("cron_task_toggled", t)
+            return jsonify(t)
+    return jsonify({"error": "not found"}), 404
+
+# ── Resources ──
+
 @app.route("/api/resources/windows", methods=["POST"])
-def receive_windows_resources():
+def api_windows_resources():
     global windows_resources
-    data = request.json
-    if data:
-        windows_resources = data
-        return jsonify({"success": True, "message": "Windows resources received"})
-    return jsonify({"error": "No data received"}), 400
+    windows_resources = request.json or {}
+    WINDOWS_RES_FILE.write_text(json.dumps(windows_resources, indent=2))
+    return jsonify({"success": True})
 
-# ─── Server Restart ────────────────────────────────
+# ── Media ──
+
+@app.route("/api/media/upload", methods=["POST"])
+def api_media_upload():
+    if "file" not in request.files:
+        return jsonify({"error": "no file"}), 400
+    f = request.files["file"]
+    dest = MEDIA_TEMP_DIR / f.filename
+    f.save(str(dest))
+    return jsonify({"success": True, "filename": f.filename})
+
+@app.route("/api/media/list")
+def api_media_list():
+    files = []
+    for f in sorted(MEDIA_TEMP_DIR.iterdir()):
+        if f.is_file() and not f.name.startswith("."):
+            # Try to get duration via ffprobe
+            duration = None
+            try:
+                result = subprocess.run(
+                    ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(f)],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    data = json.loads(result.stdout)
+                    duration = float(data.get("format", {}).get("duration", 0))
+            except Exception:
+                pass
+            files.append({
+                "name": f.name,
+                "size": f.stat().st_size,
+                "duration": duration,
+                "duration_human": f"{int(duration//60)}:{int(duration%60):02d}" if duration else None
+            })
+    return jsonify(files)
+
+@app.route("/api/media/file/<filename>")
+def api_media_file(filename):
+    f = MEDIA_TEMP_DIR / filename
+    if f.exists():
+        return send_file(str(f))
+    return jsonify({"error": "not found"}), 404
+
+@app.route("/api/media/duration/<filename>")
+def api_media_duration(filename):
+    f = MEDIA_TEMP_DIR / filename
+    if not f.exists():
+        return jsonify({"error": "not found"}), 404
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(f)],
+            capture_output=True, text=True, timeout=5
+        )
+        data = json.loads(result.stdout)
+        duration = float(data.get("format", {}).get("duration", 0))
+        return jsonify({"duration": duration})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/media/thumbnail/<filename>")
+def api_media_thumbnail(filename):
+    f = MEDIA_TEMP_DIR / filename
+    if not f.exists():
+        return jsonify({"error": "not found"}), 404
+    thumb = MEDIA_TEMP_DIR / f"{filename}_thumb.jpg"
+    if not thumb.exists():
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-ss", "0.5", "-i", str(f), "-vframes", "1", "-q:v", "2", str(thumb)],
+                capture_output=True, timeout=10
+            )
+        except Exception:
+            pass
+    if thumb.exists():
+        return send_file(str(thumb), mimetype="image/jpeg")
+    return jsonify({"error": "thumbnail failed"}), 500
+
+@app.route("/api/media/delete/<filename>", methods=["DELETE"])
+def api_media_delete(filename):
+    f = MEDIA_TEMP_DIR / filename
+    if f.exists():
+        f.unlink()
+    thumb = MEDIA_TEMP_DIR / f"{filename}_thumb.jpg"
+    if thumb.exists():
+        thumb.unlink()
+    return jsonify({"success": True})
+
+# ── Restart ──
+
 @app.route("/api/restart", methods=["POST"])
-def api_restart_server():
-    """Trigger server restart via restart_server.sh."""
-    def restart():
-        time.sleep(0.5)
-        script = Path(__file__).parent / "restart_server.sh"
-        if script.exists():
-            os.system(f"bash {script} &")
-        else:
-            os.system(f"fuser -k 5020/tcp 2>/dev/null; sleep 2; cd {Path(__file__).parent} && {sys.executable} server.py > /tmp/agentgui.log 2>&1 &")
-    threading.Thread(target=restart, daemon=True).start()
-    return jsonify({"success": True, "message": "Server restarting..."})
+def api_restart():
+    # Respond before dying
+    socketio.emit("server_restarting", {})
+    def delayed_restart():
+        time.sleep(1.5)
+        subprocess.Popen(["bash", str(project_root / "restart_server.sh")])
+    threading.Thread(target=delayed_restart, daemon=True).start()
+    return jsonify({"success": True, "message": "Restarting in 1.5s"})
 
-# ─── Main ─────────────────────────────────────────
+# ─── Socket.IO Events ─────────────────────────────────
+
+@socketio.on("connect")
+def on_connect():
+    emit("connected", {"agents": list_agents()})
+    emit("orchestrator_status", ORCH_STATUS_CACHE)
+
+@socketio.on("launch_agent")
+def handle_launch_agent(data):
+    profile = data.get("profile", "developer")
+    goal = data.get("goal", "")
+    model = data.get("model")
+    agent_id = f"{profile}_{uuid.uuid4().hex[:8]}"
+    try:
+        register_agent(agent_id, profile, goal, "")
+        # Load model from profile config if not provided
+        if not model:
+            config = load_profile_config(profile)
+            model = config.get("model")
+        result = launch_agent(profile, goal, "", agent_id=agent_id, model=model)
+        emit("agent_launched", result, broadcast=True)
+    except Exception as e:
+        emit("error", {"message": str(e)})
+
+@socketio.on("kill_agent")
+def handle_kill_agent(data):
+    agent_id = data.get("id", "")
+    try:
+        kill_agent(agent_id)
+        emit("agent_killed", {"id": agent_id}, broadcast=True)
+    except Exception as e:
+        emit("error", {"message": str(e)})
+
+@socketio.on("dispatch_task")
+def handle_dispatch_task(data):
+    """Real dispatch: creates task file, registers agent, launches tmux with model from profile config."""
+    target_profile = data.get("target_profile", data.get("profile", "developer"))
+    task_text = data.get("task", "")
+    
+    # Map short IDs to full profile names
+    profile_map = {"dev": "developer", "mm": "multimedia", "res": "researcher", "wiki": "wiki", "dreamer": "dreamer"}
+    profile = profile_map.get(target_profile, target_profile)
+    
+    agent_id = f"{profile}_{uuid.uuid4().hex[:8]}"
+    
+    # Load model from profile config
+    config = load_profile_config(profile)
+    model = config.get("model")
+    
+    # Create task file
+    task_file = DATA_DIR / f"{agent_id}_task.json"
+    task_data = {
+        "id": agent_id,
+        "profile": profile,
+        "goal": task_text,
+        "model": model,
+        "created_at": datetime.now().isoformat()
+    }
+    task_file.write_text(json.dumps(task_data, indent=2, ensure_ascii=False))
+    
+    # Register in state
+    register_agent(agent_id, profile, task_text, "")
+    
+    # Load skills config for the profile
+    skills_config = load_skills_config(profile)
+    enabled_skills = skills_config.get("enabled", [])
+    
+    # Launch with model
+    result = launch_agent(profile, task_text, "", agent_id=agent_id, model=model)
+    
+    # Save to history
+    save_history_entry({
+        "id": agent_id,
+        "profile": profile,
+        "task": task_text,
+        "model": model,
+        "timestamp": datetime.now().isoformat(),
+        "status": "dispatched"
+    })
+    
+    emit("task_dispatched", {"id": agent_id, "profile": profile, "task": task_text, "model": model}, broadcast=True)
+
+@socketio.on("add_cron_task")
+def handle_add_cron(data):
+    tasks = load_cron_tasks()
+    task = {
+        "id": uuid.uuid4().hex[:8],
+        "profile": data.get("profile", "researcher"),
+        "task": data.get("task", ""),
+        "hour": int(data.get("hour", 12)),
+        "minute": int(data.get("minute", 0)),
+        "days": data.get("days", [0,1,2,3,4]),
+        "repeat_type": data.get("repeat_type", "infinite"),
+        "repeat_count": int(data.get("repeat_count", 1)),
+        "runs_done": 0,
+        "enabled": True,
+        "created_at": datetime.now().isoformat()
+    }
+    tasks.append(task)
+    save_cron_tasks(tasks)
+    emit("cron_task_added", task, broadcast=True)
+
+@socketio.on("remove_cron_task")
+def handle_remove_cron(data):
+    task_id = data.get("id", "")
+    tasks = load_cron_tasks()
+    tasks = [t for t in tasks if t["id"] != task_id]
+    save_cron_tasks(tasks)
+    emit("cron_task_removed", {"id": task_id}, broadcast=True)
+
+@socketio.on("toggle_cron_task")
+def handle_toggle_cron(data):
+    task_id = data.get("id", "")
+    tasks = load_cron_tasks()
+    for t in tasks:
+        if t["id"] == task_id:
+            t["enabled"] = not t.get("enabled", True)
+            save_cron_tasks(tasks)
+            emit("cron_task_toggled", t, broadcast=True)
+            return
+
+@socketio.on("list_cron_tasks")
+def handle_list_cron():
+    emit("cron_tasks_update", load_cron_tasks())
+
+@socketio.on("orchestrator_message")
+def handle_orch_message(data):
+    text = data.get("text", "")
+    if not text:
+        return
+    # Store in inbox
+    inbox = load_orch_inbox()
+    inbox.append({"text": text, "time": datetime.now().isoformat()})
+    save_orch_inbox(inbox)
+    emit("message_received", {"success": True})
+    # The orchestrator_agent.py (subprocess) will pick this up via Socket.IO or inbox polling
+
+@socketio.on("orchestrator_mode_change")
+def handle_orch_mode_change(data):
+    mode = data.get("mode", "brainstorm")
+    ORCH_MODE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ORCH_MODE_FILE.write_text(json.dumps({"mode": mode}))
+    ORCH_STATUS_CACHE["mode"] = mode
+    emit("orchestrator_status", ORCH_STATUS_CACHE, broadcast=True)
+
+@socketio.on("orchestrator_summarize")
+def handle_orch_summarize():
+    # Forward to orchestrator agent if connected
+    emit("orchestrator_summarize", {}, broadcast=True)
+
+# Orchestrator agent → server events (re-broadcast to all clients)
+@socketio.on("orchestrator_response")
+def handle_orch_response_socket(data):
+    emit("orchestrator_response", data, broadcast=True)
+
+@socketio.on("orchestrator_typing")
+def handle_orch_typing_socket(data):
+    emit("orchestrator_typing", data, broadcast=True)
+
+@socketio.on("orchestrator_ready")
+def handle_orch_ready(data):
+    global ORCH_STATUS_CACHE
+    ORCH_STATUS_CACHE = {"online": True, "mode": data.get("mode", "brainstorm")}
+    emit("orchestrator_status", ORCH_STATUS_CACHE, broadcast=True)
+
+@socketio.on("get_output")
+def handle_get_output(data):
+    agent_id = data.get("id", "")
+    lines = int(data.get("lines", 100))
+    output = get_agent_output(agent_id, lines)
+    emit("agent_output", {"id": agent_id, "output": output})
+
+@socketio.on("send_input")
+def handle_send_input(data):
+    agent_id = data.get("id", "")
+    text = data.get("text", "")
+    send_keys_to_agent(agent_id, text)
+    emit("input_sent", {"id": agent_id, "success": True})
+
+@socketio.on("refresh_agents")
+def handle_refresh():
+    emit("agents_list", list_agents(), broadcast=True)
+
+# ─── Background Threads ───────────────────────────────
+
+def resources_worker():
+    """Emit VM + Windows resources every 2 seconds."""
+    while True:
+        try:
+            vm_res = {
+                "cpu_percent": psutil.cpu_percent(interval=1),
+                "cpu_count": psutil.cpu_count(),
+                "cpu_freq": psutil.cpu_freq().current if psutil.cpu_freq() else 0,
+                "ram_percent": psutil.virtual_memory().percent,
+                "ram_used": round(psutil.virtual_memory().used / (1024**3), 1),
+                "ram_total": round(psutil.virtual_memory().total / (1024**3), 1),
+                "disk_percent": psutil.disk_usage("/").percent,
+                "disk_used": round(psutil.disk_usage("/").used / (1024**3), 1),
+                "disk_total": round(psutil.disk_usage("/").total / (1024**3), 1),
+            }
+            socketio.emit("resources_update", {"vm": vm_res, "windows": windows_resources})
+        except Exception as e:
+            print(f"[resources_worker] Error: {e}")
+        time.sleep(2)
+
+def sync_worker():
+    """Sync agent states every 5 seconds."""
+    while True:
+        try:
+            sync_running_agents()
+        except Exception as e:
+            print(f"[sync_worker] Error: {e}")
+        time.sleep(5)
+
+def cron_scheduler_worker():
+    """Check cron tasks every 30 seconds."""
+    while True:
+        try:
+            tasks = load_cron_tasks()
+            now = datetime.now()
+            current_day = now.weekday()  # 0=Monday, 6=Sunday
+            current_hour = now.hour
+            current_minute = now.minute
+            
+            for task in tasks:
+                if not task.get("enabled", True):
+                    continue
+                if current_hour != task.get("hour", 0) or current_minute != task.get("minute", 0):
+                    continue
+                if current_day not in task.get("days", []):
+                    continue
+                
+                # Check if already ran this minute
+                last_run = task.get("last_run", "")
+                if last_run and last_run.startswith(now.strftime("%Y-%m-%d %H:%M")):
+                    continue
+                
+                # Launch agent
+                profile = task.get("profile", "researcher")
+                task_text = task.get("task", "")
+                agent_id = f"cron_{task['id']}_{uuid.uuid4().hex[:4]}"
+                
+                task_file = DATA_DIR / f"{agent_id}_task.json"
+                task_file.write_text(json.dumps({
+                    "id": agent_id,
+                    "profile": profile,
+                    "goal": task_text,
+                    "created_at": now.isoformat()
+                }, indent=2))
+                
+                register_agent(agent_id, profile, task_text, "")
+                config = load_profile_config(profile)
+                launch_agent(profile, task_text, "", agent_id=agent_id, model=config.get("model"))
+                
+                # Update runs_done
+                task["runs_done"] = task.get("runs_done", 0) + 1
+                task["last_run"] = now.isoformat()
+                if task.get("repeat_type") == "times" and task["runs_done"] >= task.get("repeat_count", 1):
+                    task["enabled"] = False
+                
+                save_cron_tasks(tasks)
+                socketio.emit("cron_task_executed", {"id": task["id"], "agent_id": agent_id})
+                print(f"[CRON] Launched: {agent_id} for task {task['id']}")
+        except Exception as e:
+            print(f"[cron_worker] Error: {e}")
+        time.sleep(30)
+
+def orchestrator_subprocess_worker():
+    """Start orchestrator_agent.py as subprocess."""
+    orch_script = project_root / "orchestrator_agent.py"
+    if not orch_script.exists():
+        print("[orchestrator] Script not found, skipping subprocess")
+        return
+    
+    log_file = "/tmp/orchestrator_agent.log"
+    while True:
+        try:
+            print("[orchestrator] Starting subprocess...")
+            with open(log_file, "a") as log:
+                proc = subprocess.Popen(
+                    [sys.executable, str(orch_script)],
+                    stdout=log,
+                    stderr=log,
+                    env=os.environ.copy()
+                )
+                proc.wait()
+                print(f"[orchestrator] Subprocess exited with code {proc.returncode}")
+        except Exception as e:
+            print(f"[orchestrator] Error: {e}")
+        # Restart after 5s
+        time.sleep(5)
+
+# ─── Start background threads ─────────────────────────
+
+threading.Thread(target=resources_worker, daemon=True).start()
+threading.Thread(target=sync_worker, daemon=True).start()
+threading.Thread(target=cron_scheduler_worker, daemon=True).start()
+threading.Thread(target=orchestrator_subprocess_worker, daemon=True).start()
+
+# ─── Main ─────────────────────────────────────────────
+
 if __name__ == "__main__":
-    print("╔════════════════════════════════════════╗")
-    print("║  AGENTGUI v2.0 — React + Socket.IO     ║")
-    print("║  http://192.168.0.188:5020             ║")
-    print("╚════════════════════════════════════════╝")
-    # Iniciar agente orquestrador
-    start_orchestrator_agent()
-    socketio.run(app, host='0.0.0.0', port=5020, allow_unsafe_werkzeug=True)
+    print("=" * 60)
+    print("  AgentGUI Server v3.0")
+    print(f"  Port: 5020")
+    print(f"  Project: {project_root}")
+    print(f"  Ollama Local: {OLLAMA_LOCAL_URL}")
+    print("=" * 60)
+    socketio.run(app, host='0.0.0.0', port=5020, debug=False, allow_unsafe_werkzeug=True)

@@ -64,6 +64,16 @@ export default function CronTasksView({ socket }) {
     socket.emit('remove_cron_task', { id });
   };
 
+  const removeCompletedTasks = () => {
+    if (!socket) return;
+    const completed = tasks.filter(t => t.repeat_type === 'times' && (t.runs_done || 0) >= t.repeat_count);
+    if (completed.length === 0) return;
+    if (!confirm(`Apagar ${completed.length} tarefa(s) cron concluída(s)?`)) return;
+    socket.emit('remove_completed_cron_tasks');
+  };
+
+  const completedCount = tasks.filter(t => t.repeat_type === 'times' && (t.runs_done || 0) >= t.repeat_count).length;
+
   const toggleTask = (id, enabled) => {
     if (!socket) return;
     socket.emit('toggle_cron_task', { id, enabled: !enabled });
@@ -235,11 +245,26 @@ export default function CronTasksView({ socket }) {
 
       {/* List */}
       <div className="mb-6">
-        <div className="flex items-center gap-2 mb-5">
-          <div className="w-2 h-2 rounded-full bg-[var(--cyber-blue)] animate-pulse" />
-          <h3 className="section-title" style={{ color: 'var(--cyber-blue)' }}>
-            Tarefas Agendadas ({tasks.length})
-          </h3>
+        <div className="flex items-center justify-between mb-5">
+          <div className="flex items-center gap-2">
+            <div className="w-2 h-2 rounded-full bg-[var(--cyber-blue)] animate-pulse" />
+            <h3 className="section-title" style={{ color: 'var(--cyber-blue)' }}>
+              Tarefas Agendadas ({tasks.length})
+            </h3>
+          </div>
+          {completedCount > 0 && (
+            <button
+              onClick={removeCompletedTasks}
+              className="px-4 py-2 rounded-lg font-mono text-xs tracking-wider transition-all duration-300 border"
+              style={{
+                borderColor: 'rgba(239,68,68,0.3)',
+                background: 'rgba(239,68,68,0.06)',
+                color: '#ef4444',
+              }}
+            >
+              🗑 Apagar Concluídas ({completedCount})
+            </button>
+          )}
         </div>
 
         {tasks.length === 0 && (

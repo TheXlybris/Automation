@@ -25,7 +25,7 @@ def _session_exists(session_name: str) -> bool:
     _, _, rc = _tmux_cmd("has-session", "-t", session_name)
     return rc == 0
 
-def launch_agent(profile: str, goal: str, prompt: str, agent_id: str = None, timeout_minutes: int = 30) -> Dict:
+def launch_agent(profile: str, goal: str, prompt: str, agent_id: str = None, timeout_minutes: int = 30, model: str = None) -> Dict:
     """
     Launch a new Hermes agent via tmux.
     If agent_id is provided, uses it (must already be registered in state).
@@ -40,20 +40,21 @@ def launch_agent(profile: str, goal: str, prompt: str, agent_id: str = None, tim
 
     # Build the command to run inside tmux
     runner_script = Path(__file__).parent.parent / "profiles" / f"run_{profile}.py"
-
     project_dir = Path(__file__).parent.parent
 
     if runner_script.exists():
-        cmd = f"export AGENTUI_DIR={project_dir} && cd {project_dir} && python3 {runner_script} {agent_id}"
+        # Export AGENTUI_DIR and optional AGENT_MODEL for the runner
+        env_parts = [f"export AGENTUI_DIR={project_dir}"]
+        if model:
+            env_parts.append(f"export AGENT_MODEL={model}")
+        env_str = " && ".join(env_parts)
+        cmd = f"{env_str} && cd {project_dir} && python3 {runner_script} {agent_id}"
     else:
-        # Fallback: run hermes chat with prompt
-        log_file = Path(__file__).parent.parent / 'data' / f'{agent_id}.log'
-        escaped_prompt = prompt.replace("'", "'\\''")
-        cmd = (
-            f"export AGENT_ID={agent_id} AGENTUI_DIR={Path(__file__).parent.parent} "
-            f"&& cat {soul_file} | hermes chat -q '{escaped_prompt}' "
-            f"> {log_file} 2>&1"
-        )
+        # Fallback: run hermes chat directly with prompt
+        log_file = project_dir / 'data' / f'{agent_id}.log'
+        model_arg = f"-m {model}" if model else ""
+        cmd = f"cd {project_dir} && hermes chat -q \"{prompt}\" -Q --ignore-rules --source tool {model_arg} </dev/null > {log_file} 2>&1"
+
 
     # Create tmux session and run command
     _, err, rc = _tmux_cmd("new-session", "-d", "-s", session_name, "-x", "120", "-y", "40", cmd)
@@ -124,19 +125,45 @@ def get_running_sessions() -> list:
 def sync_running_agents():
     """
     Background sync: mark agents as completed/error if tmux session is gone.
+    Checks for done.flag written by the runner to distinguish success from crash.
     Should be called periodically.
     """
     from .state import list_agents, update_agent
+    from pathlib import Path
 
     running = get_running_sessions()
     active_ids = set(s.replace(TMUX_PREFIX, "") for s in running)
 
     for agent in list_agents(status_filter="running"):
         if agent["id"] not in active_ids:
-            # Session gone — agent finished
+            # Session gone — check if runner left a done flag
+            flag_path = Path(__file__).parent.parent / "data" / f"{agent['id']}_done.flag"
+            if flag_path.exists():
+                try:
+                    with open(flag_path, 'r') as f:
+                        exitcode = int(f.read().strip())
+                    flag_path.unlink()
+                    if exitcode == 0:
+                        update_agent(
+                            agent_id=agent["id"],
+                            status="completed",
+                            message="Agent terminado",
+                            progress=100
+                        )
+                    else:
+                        update_agent(
+                            agent_id=agent["id"],
+                            status="error",
+                            message="Agent terminado com erro",
+                            progress=100
+                        )
+                    continue
+                except Exception:
+                    pass
+            # No flag found (crash or killed) — mark as error
             update_agent(
                 agent_id=agent["id"],
-                status="completed",
-                message="Agent terminado",
-                progress=100
+                status="error",
+                message="Agent terminado (sem flag)",
+                progress=0
             )

@@ -7,7 +7,8 @@ set VM_IP=192.168.0.188
 set LOCAL_PORT=5020
 set SSH_KEY=%USERPROFILE%\.ssh\id_ed25519
 set PROJECT_DIR=D:\AI_Ecosystem\10_Projects\02_AgentGUI
-set MONITOR_PY=%PROJECT_DIR%\windows_monitor.py
+set MONITOR_PY=%PROJECT_DIR%\tools\windows_monitor.py
+set ANIMATOR_PY=%PROJECT_DIR%\engines\image_animator_service.py
 
 REM --- Find Python on Windows ---
 set PYTHON_CMD=""
@@ -48,7 +49,7 @@ echo [*] Checking AgentGUI server on VM...
 ssh -i "%SSH_KEY%" -o StrictHostKeyChecking=no -o ConnectTimeout=5 %VM_USER%@%VM_IP% "curl -sf http://127.0.0.1:%LOCAL_PORT%/health" >nul 2>&1
 if errorlevel 1 (
     echo     Server offline. Starting now...
-    ssh -i "%SSH_KEY%" -o StrictHostKeyChecking=no %VM_USER%@%VM_IP% "nohup /home/%VM_USER%/venv_agentgui/bin/python /media/sf_AI_Ecosystem/10_Projects/02_AgentGUI/server.py ^> /tmp/agentgui.log 2^>^&1 ^& sleep 3"
+    ssh -i "%SSH_KEY%" -o StrictHostKeyChecking=no %VM_USER%@%VM_IP% "nohup /home/%VM_USER%/venv_agentgui/bin/python /media/sf_AI_Ecosystem/10_Projects/02_AgentGUI/server.py > /tmp/agentgui.log 2>&1 & sleep 3"
     if errorlevel 1 (
         echo [ERROR] Could not start server. Check VM is reachable.
         pause
@@ -79,6 +80,27 @@ if exist "%MONITOR_PY%" (
     )
 ) else (
     echo [WARN] windows_monitor.py not found at %MONITOR_PY%
+)
+
+REM --- Start ImageAnimator GPU Service ---
+echo [*] Checking ImageAnimator GPU service...
+if exist "%ANIMATOR_PY%" (
+    netstat -an | findstr "0.0.0.0:5021" | findstr "LISTENING" >nul
+    if errorlevel 1 (
+        if "%PYTHON_CMD%"=="" (
+            echo [WARN] Python not found. ImageAnimator service cannot start.
+            echo        Install Python to enable GPU-accelerated video rendering.
+        ) else (
+            echo     Starting ImageAnimator GPU service...
+            start "ImageAnimator GPU" /MIN %PYTHON_CMD% "%ANIMATOR_PY%"
+            timeout /t 2 /nobreak >nul
+            echo [OK] ImageAnimator GPU service started
+        )
+    ) else (
+        echo [OK] ImageAnimator GPU service already running
+    )
+) else (
+    echo [WARN] image_animator_service.py not found at %ANIMATOR_PY%
 )
 
 REM --- Check SSH tunnel ---

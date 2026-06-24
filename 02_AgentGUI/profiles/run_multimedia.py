@@ -1,244 +1,129 @@
 #!/usr/bin/env python3
 """
-Runner para o perfil Multimedia.
-Recebe AGENT_ID como argumento.
-
-Se a tarefa tem 'prompt' (geracao de imagem), invoca generate_with_progress.py
-para progresso real via WebSocket do ComfyUI.
-Senao, delega ao Hermes chat generico.
+AgentGUI Profile Runner — multimedia
+Reads task file, loads SOUL.md, invokes hermes chat with the correct model.
 """
 
 import sys
+import os
 import json
 import subprocess
-import os
-import time
 from pathlib import Path
+from datetime import datetime
 
-AGENT_ID = sys.argv[1]
+# --- Auto-injected Global Logger ---
+try:
+    from core.logger_config import setup_global_logging
+    setup_global_logging(str(Path(__file__).parent.parent / "logs"))
+except Exception as e:
+    print(f"Failed to initialize logger: {e}")
+# -------------------------------------
+
 BASE_DIR = Path(os.environ.get("AGENTUI_DIR", "/media/sf_AI_Ecosystem/10_Projects/02_AgentGUI"))
-TASK_FILE = BASE_DIR / "data" / f"{AGENT_ID}_task.json"
-LOG_FILE = BASE_DIR / "data" / f"{AGENT_ID}.log"
-PROGRESS_FILE = Path(f"/tmp/progress_{AGENT_ID}.json")
-
-sys.path.insert(0, str(BASE_DIR))
-from core.state import update_agent
-
-
-def run_with_progress(task: dict):
-    """Executa geracao de imagem com progresso real via ComfyUI WebSocket."""
-    update_agent(AGENT_ID, status="running", progress=5,
-                 message="A inicializar geracao de imagem...")
-
-    prompt = task.get("prompt", "")
-    negative = task.get("negative_prompt", "")
-    context = task.get("context", "")
-
-    # Defaults do projeto
-    checkpoint = task.get("checkpoint", "DreamShaperXL_Turbo_v2_1.safetensors")
-    width = task.get("width", 2400)
-    height = task.get("height", 1350)
-    steps = task.get("steps", 70)
-    seed = task.get("seed", -1)
-    prefix = task.get("filename_prefix", "AGENTGUI")
-
-    workflow_path = task.get("workflow_path", "/media/sf_AI_Ecosystem/03_Workflows/API/Text2Image.json")
-    comfyui_url = task.get("comfyui_url", "http://127.0.0.1:8188")
-    output_dir = task.get("output_dir", "/media/sf_AI_Ecosystem/02_Engines/ComfyUI/ComfyUI/output")
-
-    cmd = [
-        sys.executable,
-        str(BASE_DIR / "generate_with_progress.py"),
-        "--workflow", workflow_path,
-        "--prompt", prompt,
-        "--negative", negative,
-        "--checkpoint", checkpoint,
-        "--width", str(width),
-        "--height", str(height),
-        "--steps", str(steps),
-        "--seed", str(seed),
-        "--filename-prefix", prefix,
-        "--output-dir", output_dir,
-        "--progress-file", str(PROGRESS_FILE),
-        "--comfyui-url", comfyui_url,
-    ]
-
-    # Limpar progress file anterior
-    PROGRESS_FILE.unlink(missing_ok=True)
-
-    update_agent(AGENT_ID, progress=10, message="A lancar gerador com progresso real...")
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        stdin=subprocess.DEVNULL,
-        cwd=str(BASE_DIR),
-    )
-
-    last_progress = 0
-    last_message = ""
-    max_wait = task.get("timeout_seconds", 1200)
-    start = time.time()
-
-    # Polling: ler progress file + verificar se processo terminou
-    while proc.poll() is None and time.time() - start < max_wait:
-        time.sleep(2)
-
-        if PROGRESS_FILE.exists():
-            try:
-                with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
-                    pdata = json.load(f)
-
-                progress = pdata.get("progress", 0)
-                status = pdata.get("status", "running")
-                message = pdata.get("message", "A gerar...")
-
-                # Evitar spam de updates iguais
-                if progress != last_progress or message != last_message:
-                    update_agent(
-                        AGENT_ID,
-                        status="running",
-                        progress=progress,
-                        message=message,
-                    )
-                    last_progress = progress
-                    last_message = message
-
-            except (json.JSONDecodeError, IOError):
-                pass
-
-    # Processo terminou (ou timeout)
-    try:
-        stdout, stderr = proc.communicate(timeout=30)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        stdout, stderr = proc.communicate()
-
-    rc = proc.returncode
-
-    # Ler estado final do progress file
-    final_progress = {"status": "unknown", "images": [], "error": None}
-    if PROGRESS_FILE.exists():
-        try:
-            with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
-                final_progress = json.load(f)
-        except (json.JSONDecodeError, IOError):
-            pass
-
-    # Compilar log
-    log_content = f"""=== STDOUT ===
-{stdout}
-=== STDERR ===
-{stderr}
-=== PROGRESS FINAL ===
-{json.dumps(final_progress, indent=2)}
-=== RC: {rc} ==="""
-
-    with open(LOG_FILE, "w", encoding="utf-8") as f:
-        f.write(log_content)
-
-    images = final_progress.get("images", [])
-    error = final_progress.get("error")
-
-    if rc == 0 and final_progress.get("status") == "completed" and images:
-        img_paths = []
-        for img in images:
-            sub = img.get("subfolder", "")
-            fname = img["filename"]
-            p = os.path.join(output_dir, sub, fname) if sub else os.path.join(output_dir, fname)
-            img_paths.append(p)
-
-        update_agent(
-            AGENT_ID,
-            status="completed",
-            progress=100,
-            message=f"Concluido: {len(images)} imagem(ns) gerada(s)",
-            output_append=f"Imagens geradas:\n" + "\n".join(img_paths) + f"\n\nSeed: {final_progress.get('step', 'N/A')}",
-        )
-    else:
-        err_msg = error or stderr[:300] or f"RC {rc}"
-        update_agent(
-            AGENT_ID,
-            status="error",
-            progress=last_progress,
-            message=f"Erro: {err_msg[:80]}",
-            error=err_msg,
-            output_append=stdout[:4000],
-        )
-
-
-def run_with_hermes(task: dict, soul: str):
-    """Delega ao agente Hermes generico (analise, audio, etc.)."""
-    update_agent(AGENT_ID, status="running", progress=10, message="A ler tarefa e SOUL.md...")
-
-    prompt = f"""{soul}
-
-## TAREFA
-{task['goal']}
-
-## PROMPT DA IMAGEM
-{task.get('prompt', '')}
-
-## CONTEXTO DO PROJETO
-{task.get('context', '')}
-
-## INSTRUCOES
-1. Executa a tarefa de acordo com as regras do perfil Multimedia.
-2. Usa ferramentas de geracao (ComfyUI) ou analise (vision) conforme necessario.
-3. Respeita limites de VRAM: RTX 4060 Ti 16GB (modelos ate 2B para img2vid).
-4. Devolve a resposta em Portugues (PT-PT).
-
-Comeca agora."""
-
-    update_agent(AGENT_ID, progress=30, message="A invocar hermes chat -q...")
-
-    cmd = ["hermes", "chat", "-q", prompt, "-Q", "--ignore-rules", "--source", "tool"]
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL,
-            timeout=task.get("timeout_seconds", 1200), cwd=str(BASE_DIR)
-        )
-        with open(LOG_FILE, "w", encoding="utf-8") as f:
-            f.write(f"=== STDOUT ===\n{result.stdout}\n=== STDERR ===\n{result.stderr}\n=== RC: {result.returncode} ===")
-
-        if result.returncode == 0:
-            update_agent(AGENT_ID, status="completed", progress=100,
-                         message="Tarefa concluida", output_append=result.stdout[:9000])
-        else:
-            update_agent(AGENT_ID, status="error", message="Erro durante execucao",
-                         error=f"RC {result.returncode}: {result.stderr[:500]}")
-    except subprocess.TimeoutExpired:
-        update_agent(AGENT_ID, status="error", error="Timeout")
-    except Exception as e:
-        update_agent(AGENT_ID, status="error", error=f"Excecao: {str(e)}")
-
+DATA_DIR = BASE_DIR / "data"
+PROFILE_NAME = "multimedia"
+SOUL_FILE = Path.home() / ".hermes" / "profiles" / PROFILE_NAME / "SOUL.md"
 
 def main():
-    if not TASK_FILE.exists():
-        update_agent(AGENT_ID, status="error", error=f"Task file nao encontrado: {TASK_FILE}")
-        return
+    if len(sys.argv) < 2:
+        print(f"Usage: python3 run_multimedia.py <agent_id>")
+        sys.exit(1)
+    
+    agent_id = sys.argv[1]
+    task_file = DATA_DIR / f"{agent_id}_task.json"
+    
+    if not task_file.exists():
+        print(f"[{agent_id}] Task file nao encontrado: {task_file}")
+        # Write done flag with error
+        done_flag = DATA_DIR / f"{agent_id}_done.flag"
+        done_flag.write_text("1")
+        sys.exit(1)
+    
+    task_data = json.loads(task_file.read_text())
+    goal = task_data.get("goal", "")
+    model = task_data.get("model")
+    
+    print(f"[{agent_id}] A ler tarefa e SOUL.md...")
+    print(f"[{agent_id}] Profile: {PROFILE_NAME}")
+    print(f"[{agent_id}] Model: {model or 'default'}")
+    print(f"[{agent_id}] Task: {goal[:100]}...")
+    
+    # Load SOUL.md if it exists
+    soul_content = ""
+    if SOUL_FILE.exists():
+        soul_content = SOUL_FILE.read_text(encoding="utf-8")
+    
+    # Load skills config
+    skills_config_path = Path.home() / ".hermes" / "profiles" / PROFILE_NAME / "skills_config.json"
+    enabled_skills = []
+    if skills_config_path.exists():
+        try:
+            sc = json.loads(skills_config_path.read_text())
+            enabled_skills = sc.get("enabled", [])
+        except Exception:
+            pass
+    
+    # Build prompt
+    prompt = f"""You are operating as the {PROFILE_NAME} profile in the AgentGUI ecosystem.
 
-    with open(TASK_FILE, "r", encoding="utf-8") as f:
-        task = json.load(f)
-
-    # Carregar SOUL.md do perfil multimedia
-    soul_path = Path.home() / ".hermes" / "profiles" / "multimedia" / "SOUL.md"
-    soul = ""
-    if soul_path.exists():
-        with open(soul_path, "r", encoding="utf-8") as f:
-            soul = f.read()
-
-    # Decidir: geracao de imagem (tem prompt longo) ou delegar ao Hermes
-    has_prompt = bool(task.get("prompt", "").strip())
-    is_image_gen = has_prompt and len(task.get("prompt", "")) > 20
-
-    if is_image_gen:
-        run_with_progress(task)
-    else:
-        run_with_hermes(task, soul)
-
+"""
+    if soul_content:
+        prompt += f"=== SOUL.md (persona) ===\n{soul_content}\n\n"
+    
+    prompt += f"=== TASK ===\n{goal}\n"
+    
+    print(f"[{agent_id}] A construir prompt...")
+    print(f"[{agent_id}] A invocar hermes chat...")
+    
+    # Build hermes chat command
+    cmd = ["hermes", "chat", "-q", prompt, "-Q", "--ignore-rules", "--source", "tool"]
+    
+    # Add model if specified
+    if model:
+        cmd.extend(["-m", model])
+    
+    # Add skills if any
+    if enabled_skills:
+        cmd.extend(["-s", ",".join(enabled_skills)])
+    
+    # Run hermes chat
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600,  # 10 minute timeout
+            stdin=subprocess.DEVNULL
+        )
+        
+        output = result.stdout
+        if result.stderr:
+            output += f"\n[STDERR]\n{result.stderr}"
+        
+        print(f"[{agent_id}] Hermes chat completed with exit code {result.returncode}")
+        print(f"[{agent_id}] Output length: {len(output)} chars")
+        
+        # Write done flag
+        done_flag = DATA_DIR / f"{agent_id}_done.flag"
+        done_flag.write_text(str(result.returncode))
+        
+        if result.returncode == 0:
+            print(f"[{agent_id}] Tarefa concluida")
+        else:
+            print(f"[{agent_id}] Tarefa terminou com erro (exit {result.returncode})")
+        
+        # Print output for tmux capture
+        if output:
+            print(output[:5000])
+        
+    except subprocess.TimeoutExpired:
+        print(f"[{agent_id}] Timeout apos 600s")
+        done_flag = DATA_DIR / f"{agent_id}_done.flag"
+        done_flag.write_text("1")
+    except Exception as e:
+        print(f"[{agent_id}] Erro: {e}")
+        done_flag = DATA_DIR / f"{agent_id}_done.flag"
+        done_flag.write_text("1")
 
 if __name__ == "__main__":
     main()

@@ -17,10 +17,11 @@ const STATUS_LABELS = {
   cancelled: 'Cancelado',
 };
 
-function AgentCard({ agent, onUpdate }) {
+function AgentCard({ agent, onDelete }) {
   const [showOutput, setShowOutput] = useState(false);
   const [output, setOutput] = useState('');
   const [outputLoading, setOutputLoading] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   const fetchOutput = async () => {
     if (!showOutput) {
@@ -41,9 +42,31 @@ function AgentCard({ agent, onUpdate }) {
     if (!confirm(`Matar agente ${agent.id}?`)) return;
     try {
       await api.kill(agent.id);
-      onUpdate();
+      if (onDelete) onDelete();
     } catch (err) {
       console.error('Erro ao matar:', err);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (agent.status === 'running') {
+      if (!confirm(`O agente ${agent.id} ainda está a correr. Matar e apagar?`)) return;
+      try {
+        await api.kill(agent.id);
+      } catch (err) {
+        console.error('Erro ao matar:', err);
+      }
+    } else {
+      if (!confirm(`Apagar agente ${agent.id}?`)) return;
+    }
+    setDeleting(true);
+    try {
+      await api.deleteAgent(agent.id);
+      if (onDelete) onDelete();
+    } catch (err) {
+      console.error('Erro ao apagar:', err);
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -109,6 +132,18 @@ function AgentCard({ agent, onUpdate }) {
           }`}
         >
           Matar
+        </button>
+        <button
+          onClick={handleDelete}
+          disabled={deleting}
+          className={`px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+            deleting
+              ? 'bg-slate-700 text-slate-500 cursor-wait'
+              : 'bg-slate-700 hover:bg-red-900 hover:text-red-200 text-slate-400'
+          }`}
+          title="Apagar"
+        >
+          {deleting ? '...' : '🗑'}
         </button>
       </div>
 
