@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=docscraper
+GenericName=Docs Extractor
+Comment=Extrai documentação de qualquer site. 5 camadas em cascata.
+Exec=bash -c '/media/sf_AI_Ecosystem/10_Projects/03_DocsRecovery/docscraper_gui.sh'
+Icon=text-html
+Terminal=false
+Categories=Utility;Network;
+StartupNotify=true
