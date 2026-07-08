@@ -1,0 +1,113 @@
+{
+  "description": "Map AgentGUI model IDs to jcode --model values and provider profiles. Unknown models fall back to auto-detection by :cloud suffix.",
+  "default_provider_profile": "ollama-local",
+  "default_tool_profile": "minimal",
+  "cloud_suffix": ":cloud",
+  "cloud_provider_profile": "ollama-cloud",
+  "local_provider_profile": "ollama-local",
+  "fallback_model": "qwen2.5-coder:7b",
+  "allowed_repo_roots": [
+    "/media/sf_AI_Ecosystem/10_Projects/",
+    "/media/sf_AI_Ecosystem/04_Data/zcode/Projects/",
+    "/home/xlybris/projects"
+  ],
+  "excluded_repo_names": ["jcode-test-ignore"],
+  "models": {
+    "qwen2.5-coder:7b": {
+      "jcode_model": "qwen2.5-coder:7b",
+      "provider_profile": "ollama-local"
+    },
+    "qwen2.5-coder": {
+      "jcode_model": "qwen2.5-coder:7b",
+      "provider_profile": "ollama-local"
+    },
+    "qwen2.5-coder:latest": {
+      "jcode_model": "qwen2.5-coder:latest",
+      "provider_profile": "ollama-local"
+    },
+    "llama3.1:8b": {
+      "jcode_model": "llama3.1:8b",
+      "provider_profile": "ollama-local"
+    },
+    "batiai/gemma4-12b:q4": {
+      "jcode_model": "batiai/gemma4-12b:q4",
+      "provider_profile": "ollama-local"
+    },
+    "gemma4:26b": {
+      "jcode_model": "gemma4:26b",
+      "provider_profile": "ollama-local"
+    },
+    "gemma4:e2b": {
+      "jcode_model": "gemma4:e2b",
+      "provider_profile": "ollama-local"
+    },
+    "phi3:mini": {
+      "jcode_model": "phi3:mini",
+      "provider_profile": "ollama-local"
+    },
+    "qwen3:8b": {
+      "jcode_model": "qwen3:8b",
+      "provider_profile": "ollama-local"
+    },
+    "qwen35-a3b:latest": {
+      "jcode_model": "qwen35-a3b:latest",
+      "provider_profile": "ollama-local"
+    },
+    "qwen3.5:35b-a3b": {
+      "jcode_model": "qwen3.5:35b-a3b",
+      "provider_profile": "ollama-local"
+    },
+    "nomic-embed-text:latest": {
+      "jcode_model": "nomic-embed-text:latest",
+      "provider_profile": "ollama-local"
+    },
+    "mxbai-embed-large:latest": {
+      "jcode_model": "mxbai-embed-large:latest",
+      "provider_profile": "ollama-local"
+    },
+    "glm-5.2": {
+      "jcode_model": "glm-5.2:cloud",
+      "provider_profile": "ollama-cloud"
+    },
+    "glm-5.2:cloud": {
+      "jcode_model": "glm-5.2:cloud",
+      "provider_profile": "ollama-cloud"
+    },
+    "kimi-k2.6": {
+      "jcode_model": "kimi-k2.6:cloud",
+      "provider_profile": "ollama-cloud"
+    },
+    "kimi-k2.6:cloud": {
+      "jcode_model": "kimi-k2.6:cloud",
+      "provider_profile": "ollama-cloud"
+    },
+    "deepseek-v4-pro": {
+      "jcode_model": "deepseek-v4-pro:cloud",
+      "provider_profile": "ollama-cloud"
+    },
+    "deepseek-v4-pro:cloud": {
+      "jcode_model": "deepseek-v4-pro:cloud",
+      "provider_profile": "ollama-cloud"
+    },
+    "qwen3-coder:480b": {
+      "jcode_model": "qwen3-coder:480b-cloud",
+      "provider_profile": "ollama-cloud"
+    },
+    "qwen3-coder:480b-cloud": {
+      "jcode_model": "qwen3-coder:480b-cloud",
+      "provider_profile": "ollama-cloud"
+    },
+    "qwen3-vl:30b-a3b-instruct": {
+      "jcode_model": "qwen3-vl:30b-a3b-instruct",
+      "provider_profile": "ollama-cloud"
+    },
+    "qwen3-vl:235b-cloud": {
+      "jcode_model": "qwen3-vl:235b-cloud",
+      "provider_profile": "ollama-cloud"
+    },
+    "gpt-oss:120b-cloud": {
+      "jcode_model": "gpt-oss:120b-cloud",
+      "provider_profile": "ollama-cloud"
+    }
+  }
+}

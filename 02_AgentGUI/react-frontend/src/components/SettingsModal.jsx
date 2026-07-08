@@ -37,20 +37,34 @@ export default function SettingsModal({ agentId, agentName, currentModel, onSave
   const [filterCategory, setFilterCategory] = useState('all');
   const [saving, setSaving] = useState(false);
 
-  // ─── Load models ───
+  // ─── SOUL state ───
+  const [soulContent, setSoulContent] = useState('');
+  const [loadingSoul, setLoadingSoul] = useState(true);
+  const [soulError, setSoulError] = useState(null);
+  const [activeTab, setActiveTab] = useState('model'); // 'model' | 'skills' | 'soul'
+
+  // ─── Load models + profile config from backend ───
   useEffect(() => {
-    fetch(`${window.location.origin}/api/models`)
-      .then(r => r.json())
-      .then(data => {
-        setModels(data.models || []);
-        if (!selectedModel && data.default) setSelectedModel(data.default);
+    Promise.all([
+      fetch(`${window.location.origin}/api/models`).then(r => r.json()),
+      fetch(`${window.location.origin}/api/profiles/${agentId}/config`).then(r => r.json()).catch(() => ({}))
+    ])
+      .then(([modelsData, profileConfig]) => {
+        setModels(modelsData.models || []);
+        // Use model from backend config (authoritative), fall back to prop, then to default
+        const backendModel = profileConfig.model || currentModel || '';
+        if (backendModel) {
+          setSelectedModel(backendModel);
+        } else if (modelsData.default) {
+          setSelectedModel(modelsData.default);
+        }
         setLoadingModels(false);
       })
       .catch(() => {
         setModelsError('Falha ao carregar modelos');
         setLoadingModels(false);
       });
-  }, []);
+  }, [agentId]);
 
   // ─── Load skills ───
   useEffect(() => {
@@ -66,6 +80,20 @@ export default function SettingsModal({ agentId, agentName, currentModel, onSave
       .catch(() => {
         setSkillsError('Falha ao carregar skills');
         setLoadingSkills(false);
+      });
+  }, [agentId]);
+
+  // ─── Load SOUL ───
+  useEffect(() => {
+    fetch(`${window.location.origin}/api/profiles/${agentId}/soul`)
+      .then(r => r.json())
+      .then(data => {
+        setSoulContent(data.content || '');
+        setLoadingSoul(false);
+      })
+      .catch(() => {
+        setSoulError('Falha ao carregar SOUL');
+        setLoadingSoul(false);
       });
   }, [agentId]);
 
@@ -96,6 +124,14 @@ export default function SettingsModal({ agentId, agentName, currentModel, onSave
         body: JSON.stringify(skillsConfig)
       });
     } catch (e) { /* silent */ }
+    // 3. Save SOUL
+    try {
+      await fetch(`${window.location.origin}/api/profiles/${agentId}/soul`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: soulContent })
+      });
+    } catch (e) { /* silent */ }
     setSaving(false);
     onClose();
   };
@@ -121,7 +157,7 @@ export default function SettingsModal({ agentId, agentName, currentModel, onSave
 
   return (
     <div className="settings-modal-backdrop" onClick={onClose}>
-      <div className="settings-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: '520px', maxHeight: '85vh', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+      <div className="settings-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: '600px', maxHeight: '90vh', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
         {/* Header */}
         <div className="flex items-center justify-between mb-3">
           <h3 className="text-sm font-mono font-bold tracking-wider" style={{ color: 'var(--cyber-blue)' }}>
@@ -135,7 +171,39 @@ export default function SettingsModal({ agentId, agentName, currentModel, onSave
         {/* Scrollable body */}
         <div style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
 
-          {/* ─── MODELO ─── */}
+          {/* ─── TABS ─── */}
+          <div className="flex gap-1 mb-3">
+            <button
+              onClick={() => setActiveTab('model')}
+              className="px-3 py-1.5 rounded-t-lg text-[10px] font-mono font-bold border-b-2 transition-colors"
+              style={{
+                color: activeTab === 'model' ? 'var(--cyber-blue)' : 'var(--text-muted)',
+                borderColor: activeTab === 'model' ? 'var(--cyber-blue)' : 'transparent',
+                background: activeTab === 'model' ? 'var(--bg-primary)' : 'transparent'
+              }}
+            >🤖 Modelo</button>
+            <button
+              onClick={() => setActiveTab('skills')}
+              className="px-3 py-1.5 rounded-t-lg text-[10px] font-mono font-bold border-b-2 transition-colors"
+              style={{
+                color: activeTab === 'skills' ? 'var(--matrix-green)' : 'var(--text-muted)',
+                borderColor: activeTab === 'skills' ? 'var(--matrix-green)' : 'transparent',
+                background: activeTab === 'skills' ? 'var(--bg-primary)' : 'transparent'
+              }}
+            >🧠 Skills</button>
+            <button
+              onClick={() => setActiveTab('soul')}
+              className="px-3 py-1.5 rounded-t-lg text-[10px] font-mono font-bold border-b-2 transition-colors"
+              style={{
+                color: activeTab === 'soul' ? 'var(--c084fc, #c084fc)' : 'var(--text-muted)',
+                borderColor: activeTab === 'soul' ? '#c084fc' : 'transparent',
+                background: activeTab === 'soul' ? 'var(--bg-primary)' : 'transparent'
+              }}
+            >👻 SOUL</button>
+          </div>
+
+          {/* ─── MODELO TAB ─── */}
+          {activeTab === 'model' && (
           <div className="mb-4 p-3 rounded-lg border" style={{ borderColor: 'var(--border-subtle)', background: 'var(--bg-primary)' }}>
             <label className="text-[11px] font-mono text-[var(--text-secondary)] block mb-2">
               🤖 MODELO
@@ -159,8 +227,10 @@ export default function SettingsModal({ agentId, agentName, currentModel, onSave
               </select>
             )}
           </div>
+          )}
 
-          {/* ─── SKILLS ─── */}
+          {/* ─── SKILLS TAB ─── */}
+          {activeTab === 'skills' && (
           <div className="mb-4 p-3 rounded-lg border" style={{ borderColor: 'var(--border-subtle)', background: 'var(--bg-primary)' }}>
             <label className="text-[11px] font-mono text-[var(--text-secondary)] block mb-2">
               🧠 SKILLS
@@ -226,9 +296,45 @@ export default function SettingsModal({ agentId, agentName, currentModel, onSave
               </>
             )}
           </div>
+          )}
 
-          {/* ─── FUTURE SECTIONS GO HERE ─── */}
-          {/* Add new setting blocks above the footer; Guardar handles all */}
+          {/* ─── SOUL TAB ─── */}
+          {activeTab === 'soul' && (
+          <div className="mb-4 p-3 rounded-lg border" style={{ borderColor: 'var(--border-subtle)', background: 'var(--bg-primary)' }}>
+            <label className="text-[11px] font-mono text-[var(--text-secondary)] block mb-2">
+              👻 SOUL — System Prompt
+            </label>
+            {loadingSoul ? (
+              <div className="text-[10px] text-[var(--text-dim)] font-mono animate-pulse py-2">A carregar SOUL...</div>
+            ) : soulError ? (
+              <div className="text-[10px] text-[var(--alert-red)] font-mono py-2">{soulError}</div>
+            ) : (
+              <>
+                <p className="text-[9px] font-mono mb-2" style={{ color: 'var(--text-dim)' }}>
+                  Edita o system prompt (SOUL.md) deste perfil. As alterações são aplicadas na próxima vez que o agente arrancar.
+                </p>
+                <textarea
+                  value={soulContent}
+                  onChange={e => setSoulContent(e.target.value)}
+                  className="settings-select w-full font-mono text-[10px]"
+                  style={{
+                    minHeight: '300px',
+                    resize: 'vertical',
+                    padding: '8px',
+                    background: 'var(--bg-secondary)',
+                    borderColor: 'var(--border-subtle)',
+                    color: 'var(--text-primary)',
+                    lineHeight: '1.5'
+                  }}
+                  spellCheck={false}
+                />
+                <p className="text-[8px] font-mono mt-1" style={{ color: 'var(--text-muted)' }}>
+                  {soulContent.length} chars · {soulContent.split('\n').length} linhas
+                </p>
+              </>
+            )}
+          </div>
+          )}
 
         </div>
 
