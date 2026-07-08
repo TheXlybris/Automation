@@ -21,7 +21,6 @@ from flask import Flask, jsonify, request, send_from_directory, send_file, Respo
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 import psutil
-
 try:
     import git
     HAS_GIT = True
@@ -60,6 +59,11 @@ try:
         launch_agent, get_agent_output, kill_agent,
         send_keys_to_agent, sync_running_agents
     )
+    from core.jcode_runner import (
+        run_jcode, get_jcode_status, kill_jcode_run, list_jcode_runs,
+        load_jcode_map, resolve_jcode_model, list_jcode_run_summaries
+    )
+    from core.jcode_classifier import classify_task
 except ImportError as e:
     print(f"Critical Error: Could not import core modules. {e}")
 
@@ -80,10 +84,42 @@ def load_profile_config(profile_id: str) -> dict:
             pass
     return {"model": None, "provider": None}
 
+def _detect_provider(model_id: str) -> str:
+    """Auto-detect provider from model ID suffix."""
+    if not model_id:
+        return None
+    # Cloud suffixes: :cloud and -cloud
+    if model_id.endswith(":cloud") or model_id.endswith("-cloud"):
+        return "ollama-cloud"
+    # Known cloud base names (without suffix)
+    cloud_bases = {"kimi-k2.6", "glm-5.2", "deepseek-v4-pro", "qwen3-coder:480b",
+                   "qwen3-vl:30b-a3b-instruct", "qwen3-vl:235b", "gpt-oss:120b"}
+    base = model_id
+    for suffix in (":cloud", "-cloud"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    if base in cloud_bases:
+        return "ollama-cloud"
+    return "ollama-local"
+
 def save_profile_config(profile_id: str, config: dict):
+    """Merge new config into existing config (preserves fields not in the update)."""
     p = get_profile_config_path(profile_id)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    # Load existing config
+    existing = {}
+    if p.exists():
+        try:
+            existing = json.loads(p.read_text())
+        except Exception:
+            pass
+    # Merge: new values override existing, but existing values are preserved if not in new config
+    merged = {**existing, **config}
+    # Auto-detect provider whenever model is present — always recalculate to match current model
+    if merged.get("model"):
+        merged["provider"] = _detect_provider(merged["model"])
+    p.write_text(json.dumps(merged, indent=2), encoding="utf-8")
 
 def get_profile_skills_config_path(profile_id: str) -> Path:
     return HERMES_PROFILES_DIR / profile_id / "skills_config.json"
@@ -186,8 +222,9 @@ def skills_grouped_by_category() -> dict:
 OLLAMA_LOCAL_URL = "http://192.168.0.187:11434"
 
 def list_models() -> dict:
-    """Fetch available models from Ollama local + cloud defaults."""
+    """Fetch available models from Ollama local + cloud defaults, deduped by base name."""
     models = []
+    seen_base_names = set()
 
     # 1. Local Ollama
     try:
@@ -198,6 +235,13 @@ def list_models() -> dict:
                 name = m.get("name", "")
                 if name.endswith(":latest"):
                     name = name.replace(":latest", "")
+                # Track base name (strip :cloud / -cloud suffix) to dedup with cloud defaults
+                base_name = name
+                for suffix in (":cloud", "-cloud"):
+                    if base_name.endswith(suffix):
+                        base_name = base_name[: -len(suffix)]
+                        break
+                seen_base_names.add(base_name)
                 models.append({
                     "id": m.get("name", ""),
                     "name": name,
@@ -208,7 +252,7 @@ def list_models() -> dict:
     except Exception:
         pass
 
-    # 2. Cloud defaults
+    # 2. Cloud defaults — skip if local Ollama already has same base name
     cloud_defaults = [
         {"id": "kimi-k2.6", "name": "kimi-k2.6", "size": None, "source": "cloud"},
         {"id": "glm-5.2", "name": "glm-5.2", "size": None, "source": "cloud"},
@@ -216,7 +260,7 @@ def list_models() -> dict:
         {"id": "qwen3-coder:480b", "name": "qwen3-coder 480b", "size": None, "source": "cloud"},
     ]
     for cm in cloud_defaults:
-        if cm["id"] not in [m["id"] for m in models]:
+        if cm["id"] not in seen_base_names:
             models.append(cm)
 
     # Get default model from hermes config
@@ -415,6 +459,25 @@ def api_profile_config(profile_id):
         save_profile_config(profile_id, config)
         return jsonify({"success": True})
 
+# ── Profile SOUL (system prompt editor) ──
+
+def get_profile_soul_path(profile_id: str) -> Path:
+    return HERMES_PROFILES_DIR / profile_id / "SOUL.md"
+
+@app.route("/api/profiles/<profile_id>/soul", methods=["GET", "POST"])
+def api_profile_soul(profile_id):
+    soul_path = get_profile_soul_path(profile_id)
+    if request.method == "GET":
+        if soul_path.exists():
+            return jsonify({"content": soul_path.read_text(encoding="utf-8"), "exists": True})
+        return jsonify({"content": "", "exists": False})
+    else:
+        data = request.json or {}
+        content = data.get("content", "")
+        soul_path.parent.mkdir(parents=True, exist_ok=True)
+        soul_path.write_text(content, encoding="utf-8")
+        return jsonify({"success": True})
+
 # ── Orchestrator ──
 
 @app.route("/api/orchestrator/inbox")
@@ -424,10 +487,13 @@ def api_orch_inbox():
 @app.route("/api/orchestrator/response", methods=["POST"])
 def api_orch_response():
     data = request.json or {}
-    text = data.get("text", "")
+    text = data.get("text", "") or data.get("message", "")
     profile = data.get("profile")
-    socketio.emit("orchestrator_response", {"text": text, "profile": profile})
-    return jsonify({"success": True})
+    inbox = load_orch_inbox()
+    inbox.append({"text": text, "profile": profile, "time": datetime.now().isoformat()})
+    save_orch_inbox(inbox)
+    socketio.emit("orchestrator_message", {"text": text, "profile": profile})
+    return jsonify({"success": True, "inbox_count": len(inbox)})
 
 @app.route("/api/orchestrator/mark_processed", methods=["POST"])
 def api_orch_mark_processed():
@@ -437,6 +503,33 @@ def api_orch_mark_processed():
     state["last_processed"] = count
     save_orch_state(state)
     return jsonify({"success": True})
+
+@app.route("/api/orchestrator/mode", methods=["GET", "POST"])
+def api_orch_mode():
+    if request.method == "POST":
+        data = request.json or {}
+        new_mode = data.get("mode", "brainstorm")
+        ORCH_MODE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ORCH_MODE_FILE.write_text(json.dumps({"mode": new_mode}))
+        ORCH_STATUS_CACHE["mode"] = new_mode
+        socketio.emit("orchestrator_status", ORCH_STATUS_CACHE)
+        socketio.emit("orchestrator_mode_change", {"mode": new_mode})
+        return jsonify({"success": True, "mode": new_mode})
+    mode = "brainstorm"
+    if ORCH_MODE_FILE.exists():
+        try:
+            mode = json.loads(ORCH_MODE_FILE.read_text()).get("mode", "brainstorm")
+        except Exception:
+            pass
+    return jsonify({"mode": mode})
+
+@app.route("/api/dispatch", methods=["POST"])
+def api_dispatch():
+    """REST fallback for dispatch_task (used by orchestrator agent and external callers)."""
+    data = request.json or {}
+    # Avoid emit inside REST context; call core logic directly if possible.
+    result = _dispatch_task_impl(data)
+    return jsonify(result)
 
 @app.route("/api/orchestrator/state")
 def api_orch_state():
@@ -613,6 +706,113 @@ def api_restart():
     threading.Thread(target=delayed_restart, daemon=True).start()
     return jsonify({"success": True, "message": "Restarting in 1.5s"})
 
+# ─── jcode endpoints ───
+
+def update_agent_from_jcode_stream(run_id: str, chunk: str):
+    """Append a jcode stream chunk to the linked agent's output buffer."""
+    # run_id may be prefixed with agent_id: <agent_id>_jcode_<hash>
+    if not run_id.startswith("jcode_"):
+        parts = run_id.split("_jcode_", 1)
+        if len(parts) == 2:
+            agent_id = parts[0]
+            update_agent(agent_id, output_append=chunk)
+
+@app.route("/api/jcode/run", methods=["POST"])
+def api_jcode_run():
+    data = request.get_json(force=True) or {}
+    repo_path = data.get("repo_path")
+    task = data.get("task")
+    model = data.get("model")
+    tool_profile = data.get("tool_profile")
+    timeout = int(data.get("timeout", 600))
+    agent_id = data.get("agent_id")
+
+    if not repo_path or not task:
+        return jsonify({"error": "repo_path and task are required"}), 400
+
+    try:
+        run_id = run_jcode(
+            repo_path=repo_path,
+            task=task,
+            model=model,
+            tool_profile=tool_profile,
+            timeout=timeout,
+            agent_id=agent_id,
+            socketio=socketio,
+            on_chunk=lambda rid, chunk: update_agent_from_jcode_stream(rid, chunk),
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"run_id": run_id, "status": "running"}), 202
+
+
+@app.route("/api/jcode/runs", methods=["GET"])
+def api_jcode_runs():
+    agent_id = request.args.get("agent_id")
+    return jsonify(list_jcode_runs(agent_id=agent_id))
+
+
+@app.route("/api/jcode/runs/summary", methods=["GET"])
+def api_jcode_run_summaries():
+    """Return compact summaries of jcode runs for visual history."""
+    agent_id = request.args.get("agent_id")
+    try:
+        limit = max(1, min(200, int(request.args.get("limit", 50))))
+    except ValueError:
+        limit = 50
+    return jsonify(list_jcode_run_summaries(agent_id=agent_id, limit=limit))
+
+
+@app.route("/api/jcode/<run_id>", methods=["GET"])
+def api_jcode_status(run_id: str):
+    state = get_jcode_status(run_id)
+    if not state:
+        return jsonify({"error": "run not found"}), 404
+    return jsonify(state)
+
+
+@app.route("/api/jcode/<run_id>/kill", methods=["POST"])
+def api_jcode_kill(run_id: str):
+    if kill_jcode_run(run_id, socketio=socketio):
+        return jsonify({"run_id": run_id, "status": "cancelled"})
+    return jsonify({"error": "run not found or not running"}), 404
+
+
+@socketio.on("kill_jcode_run")
+def handle_kill_jcode_run(data):
+    """Socket.IO kill for jcode runs (frontend real-time stop button)."""
+    run_id = data.get("run_id", "")
+    if not run_id:
+        emit("error", {"message": "run_id required"})
+        return
+    if kill_jcode_run(run_id, socketio=socketio):
+        emit("jcode_run_killed", {"run_id": run_id, "status": "cancelled"}, broadcast=True)
+    else:
+        emit("error", {"message": f"jcode run {run_id} not found or not running"})
+
+
+@app.route("/api/jcode/repos", methods=["GET"])
+def api_jcode_repos():
+    """List allowed repository roots and their subdirectories for jcode."""
+    cfg = load_jcode_map()
+    roots = cfg.get("allowed_repo_roots", ["/media/sf_AI_Ecosystem/10_Projects/"])
+    repos = []
+    for root in roots:
+        p = Path(root)
+        if p.exists() and p.is_dir():
+            try:
+                seen = set()
+                excluded = set(cfg.get("excluded_repo_names", []))
+                for sub in sorted(p.iterdir()):
+                    if sub.is_dir() and sub.name not in excluded and str(sub) not in seen:
+                        repos.append({"path": str(sub), "name": sub.name, "root": root})
+                        seen.add(str(sub))
+            except Exception:
+                pass
+    return jsonify({"roots": roots, "repos": repos})
+
+
 # ─── Socket.IO Events ─────────────────────────────────
 
 @socketio.on("connect")
@@ -646,54 +846,107 @@ def handle_kill_agent(data):
     except Exception as e:
         emit("error", {"message": str(e)})
 
-@socketio.on("dispatch_task")
-def handle_dispatch_task(data):
-    """Real dispatch: creates task file, registers agent, launches tmux with model from profile config."""
+def _dispatch_task_impl(data: dict) -> dict:
+    """Core dispatch logic; can be called from REST or Socket.IO."""
     target_profile = data.get("target_profile", data.get("profile", "developer"))
     task_text = data.get("task", "")
-    
-    # Map short IDs to full profile names
+    use_jcode = data.get("use_jcode", False)
+    repo_path = data.get("repo_path")
+    tool_profile = data.get("tool_profile")
+    timeout = int(data.get("timeout", 600))
+
     profile_map = {"dev": "developer", "mm": "multimedia", "res": "researcher", "wiki": "wiki", "dreamer": "dreamer"}
     profile = profile_map.get(target_profile, target_profile)
-    
+
     agent_id = f"{profile}_{uuid.uuid4().hex[:8]}"
-    
-    # Load model from profile config
+
     config = load_profile_config(profile)
     model = config.get("model")
-    
-    # Create task file
+
+    # developer always delegates to jcode
+    use_jcode = (profile == "developer")
+    classification = None
+
     task_file = DATA_DIR / f"{agent_id}_task.json"
     task_data = {
         "id": agent_id,
         "profile": profile,
         "goal": task_text,
         "model": model,
+        "use_jcode": use_jcode,
+        "repo_path": repo_path,
+        "tool_profile": tool_profile,
+        "timeout": timeout,
         "created_at": datetime.now().isoformat()
     }
     task_file.write_text(json.dumps(task_data, indent=2, ensure_ascii=False))
-    
-    # Register in state
+
     register_agent(agent_id, profile, task_text, "")
-    
-    # Load skills config for the profile
-    skills_config = load_skills_config(profile)
-    enabled_skills = skills_config.get("enabled", [])
-    
-    # Launch with model
-    result = launch_agent(profile, task_text, "", agent_id=agent_id, model=model)
-    
-    # Save to history
+
+    result = {}
+    jcode_run_id = None
+
+    if profile == "developer" and use_jcode:
+        default_repo = "/media/sf_AI_Ecosystem/10_Projects/"
+        target_repo = repo_path or default_repo
+        try:
+            jcode_run_id = run_jcode(
+                repo_path=target_repo,
+                task=task_text,
+                model=model,
+                tool_profile=tool_profile,
+                timeout=timeout,
+                agent_id=agent_id,
+                socketio=socketio,
+                on_chunk=lambda rid, chunk: update_agent_from_jcode_stream(rid, chunk),
+            )
+            update_agent(agent_id, status="running", message=f"jcode run {jcode_run_id}")
+            result = {"agent_id": agent_id, "jcode_run_id": jcode_run_id, "status": "running"}
+        except Exception as e:
+            update_agent(agent_id, status="error", error=str(e), message="Falha ao iniciar jcode")
+            result = {"error": str(e)}
+    else:
+        result = launch_agent(profile, task_text, "", agent_id=agent_id, model=model)
+
     save_history_entry({
         "id": agent_id,
         "profile": profile,
         "task": task_text,
         "model": model,
+        "use_jcode": use_jcode,
+        "jcode_classification": classification,
+        "jcode_run_id": jcode_run_id,
         "timestamp": datetime.now().isoformat(),
         "status": "dispatched"
     })
-    
-    emit("task_dispatched", {"id": agent_id, "profile": profile, "task": task_text, "model": model}, broadcast=True)
+
+    return {
+        "id": agent_id,
+        "profile": profile,
+        "task": task_text,
+        "model": model,
+        "use_jcode": use_jcode,
+        "jcode_classification": classification,
+        "jcode_run_id": jcode_run_id,
+        **result
+    }
+
+
+@socketio.on("dispatch_task")
+def handle_dispatch_task(data):
+    """Socket.IO wrapper around _dispatch_task_impl."""
+    result = _dispatch_task_impl(data)
+    emit("task_dispatched", {
+        "id": result["id"],
+        "profile": result["profile"],
+        "task": result["task"],
+        "model": result["model"],
+        "use_jcode": result["use_jcode"],
+        "jcode_classification": result["jcode_classification"],
+        "jcode_run_id": result["jcode_run_id"],
+    })
+    if "error" in result:
+        emit("error", {"message": result["error"]})
 
 @socketio.on("add_cron_task")
 def handle_add_cron(data):
@@ -796,6 +1049,7 @@ def handle_send_input(data):
 def handle_refresh():
     emit("agents_list", list_agents(), broadcast=True)
 
+# ─── Background Threads ───────────────────────────────
 # ─── Background Threads ───────────────────────────────
 
 def resources_worker():

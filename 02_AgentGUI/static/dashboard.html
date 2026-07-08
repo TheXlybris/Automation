@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AgentGUI Dashboard (WebSocket)</title>
+  <link rel="stylesheet" href="/dashboard.css">
+</head>
+<body>
+  <header>
+    <h1>AgentGUI <span class="ws-badge" id="ws-badge">●</span></h1>
+    <p>Dashboard nativo WebSocket — perfil developer com jcode</p>
+  </header>
+
+  <main>
+    <section class="launch-panel">
+      <h2>Lançar Developer Task</h2>
+      <div class="form-row">
+        <label for="repo-path">Repo:</label>
+        <select id="repo-path"></select>
+      </div>
+      <div class="form-row">
+        <label for="task-input">Tarefa:</label>
+        <textarea id="task-input" rows="3" placeholder="Descreve o que o developer deve fazer...">jcode: create a file named ws_dashboard_test.txt with the text 'websocket dashboard OK' and nothing else.</textarea>
+      </div>
+      <div class="form-row inline">
+        <label>
+          <input type="checkbox" id="use-jcode" checked>
+          Usar jcode
+        </label>
+        <span id="classification-reason" class="reason"></span>
+      </div>
+      <div class="form-row inline">
+        <button id="btn-dispatch" class="btn-primary">Lançar</button>
+        <button id="btn-kill" class="btn-secondary" disabled>Parar jcode</button>
+      </div>
+      <div id="dispatch-status" class="status-msg"></div>
+    </section>
+
+    <section class="output-panel">
+      <h2>Output em tempo real</h2>
+      <div class="output-meta">
+        <span id="output-run-id"></span>
+        <span id="output-model"></span>
+        <span id="output-status"></span>
+      </div>
+      <pre id="live-output" class="live-output">Aguarda lançamento...</pre>
+    </section>
+
+    <section class="history-panel">
+      <h2>Histórico de runs jcode</h2>
+      <button id="btn-refresh-history" class="btn-small">Atualizar</button>
+      <table id="history-table">
+        <thead>
+          <tr>
+            <th>Run ID</th>
+            <th>Status</th>
+            <th>Modelo</th>
+            <th>Duração</th>
+            <th>Ops</th>
+            <th>Preview</th>
+          </tr>
+        </thead>
+        <tbody id="history-tbody">
+          <tr class="empty-row"><td colspan="6">Sem runs.</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+  <script src="https://cdn.socket.io/4.8.1/socket.io.min.js" crossorigin="anonymous"></script>
+  <script src="/dashboard.js"></script>
+</body>
+</html>

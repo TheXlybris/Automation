@@ -38,9 +38,29 @@ SERVER_URL = "http://192.168.0.188:5020"
 # Ollama Cloud:   https://ollama.com/v1
 ORCH_CONFIG_FILE = Path.home() / ".hermes" / "profiles" / "orchestrator" / "agentgui_config.json"
 
-CLOUD_MODELS = {"kimi-k2.6", "glm-5.2", "deepseek-v4-pro", "qwen3-coder:480b"}
+CLOUD_MODELS = {"kimi-k2.6", "glm-5.2", "deepseek-v4-pro", "qwen3-coder:480b",
+                "gpt-oss:120b", "qwen3-vl:235b"}
 LOCAL_OLLAMA_URL = "http://192.168.0.187:11434/v1"
 CLOUD_OLLAMA_URL = "https://ollama.com/v1"
+
+# Sufixos que o Ollama acrescenta para distinguir cloud de local
+_CLOUD_SUFFIXES = (":cloud", "-cloud")
+
+def _normalize_model(model_id: str) -> str:
+    """Remove sufixos :cloud / -cloud do ID do modelo.
+    O Ollama Cloud API espera o nome base (ex: 'glm-5.2', não 'glm-5.2:cloud').
+    """
+    for suf in _CLOUD_SUFFIXES:
+        if model_id.endswith(suf):
+            return model_id[:-len(suf)]
+    return model_id
+
+def _is_cloud_model(model_id: str) -> bool:
+    """Detecta se um modelo é cloud (por sufixo ou por nome conhecido)."""
+    base = _normalize_model(model_id)
+    if base in CLOUD_MODELS:
+        return True
+    return model_id.endswith(_CLOUD_SUFFIXES)
 
 def _load_api_config():
     """Read model + base_url from profile config file, fall back to defaults."""
@@ -53,14 +73,14 @@ def _load_api_config():
             cfg = json.loads(ORCH_CONFIG_FILE.read_text())
             cfg_model = cfg.get("model")
             if cfg_model:
-                model = cfg_model
-                # Auto-detect: cloud vs local based on model name
-                if cfg_model not in CLOUD_MODELS and not cfg_model.endswith(":cloud"):
-                    base_url = LOCAL_OLLAMA_URL
-                    # Local Ollama doesn't need API key, but send empty string
-                    api_key = api_key or "ollama"
-                else:
+                # Normalizar: remover sufixo :cloud/-cloud se presente
+                model = _normalize_model(cfg_model)
+                # Auto-detect: cloud vs local
+                if _is_cloud_model(cfg_model):
                     base_url = CLOUD_OLLAMA_URL
+                else:
+                    base_url = LOCAL_OLLAMA_URL
+                    api_key = api_key or "ollama"
         except Exception as e:
             print(f"[WARN] Could not read orchestrator config: {e}")
 
@@ -71,7 +91,8 @@ MODEL, BASE_URL, API_KEY = _load_api_config()
 
 MAX_HISTORY = 30      # janela deslizante
 SUMMARY_THRESHOLD = 20  # quando atinge 20 msgs, resumir primeiras 10
-MAX_TURNS = 8         # máximo de iterações de tool-calling por mensagem
+MAX_TURNS = 50        # máximo de iterações de tool-calling por mensagem
+MAX_INBOX_KEEP = 5    # nº de mensagens a manter no inbox após limpeza
 
 # ─── Tools definition ────────────────────────────────
 
@@ -170,19 +191,55 @@ ORCHESTRATOR_TOOLS = BRAINSTORM_TOOLS + [
     {
         "type": "function",
         "function": {
-            "name": "web_search",
-            "description": "Pesquisa na web via Tavily API.",
+            "name": "delegate_to_developer",
+            "description": (
+                "A UNICA forma de criar, modificar, corrigir ou investigar codigo fonte, "
+                "scripts de projecto, configuracoes tecnicas ou infraestrutura. Delega a tarefa "
+                "ao perfil Developer do AgentGUI, que executa via jcode. "
+                "USO OBRIGATORIO para: escrever/editar ficheiros de codigo (.py, .js, .jsx, .ts, .sh, etc.), "
+                "corrigir bugs, refactors, builds, tests, git, ou qualquer alteracao ao projecto. "
+                "Nao tentes fazer isto com write_file ou terminal — delega SEMPRE ao Developer."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Query de pesquisa"},
-                    "limit": {"type": "integer", "description": "Número de resultados (default 5)"}
+                    "task": {"type": "string", "description": "Descricao detalhada da tarefa de codigo"},
+                    "repo_path": {"type": "string", "description": "Caminho absoluto do repositorio onde o codigo deve ser alterado (opcional; se omitido, usa o default)"}
                 },
-                "required": ["query"]
+                "required": ["task"]
             }
         }
     }
 ]
+
+# ─── Tool Selection by Model Capability ───────────────
+
+def _is_local_model(model: str) -> bool:
+    """True se o modelo é servido pelo Ollama local (não cloud).
+
+    Usa a mesma heurística que _load_api_config: modelos cloud são os do
+    CLOUD_MODELS ou com sufixo ':cloud'/'-cloud'; todos os outros são locais.
+    Modelos locais (tipicamente 7B-26B) são menos fiáveis a inibir tools via
+    instrução de texto, por isso _tools_for reduz-lhes o conjunto.
+    """
+    return not _is_cloud_model(model)
+
+def _tools_for(mode: str, model: str = None) -> List[Dict]:
+    """Devolve o conjunto de tools adequado ao modo e ao modelo.
+
+    - brainstorm: tools só de leitura (igual ao BRAINSTORM_TOOLS).
+    - orchestrator + modelo cloud: ORCHESTRATOR_TOOLS completo.
+    - orchestrator + modelo local: ORCHESTRATOR_TOOLS SEM write_file nem
+      terminal. Assim o modelo local só consegue investigar (read/list/wiki)
+      e delegar código via delegate_to_developer — não lhe resta write_file
+      nem terminal como caminho errado para "escrever código".
+    """
+    if mode == "brainstorm":
+        return BRAINSTORM_TOOLS
+    if model is not None and _is_local_model(model):
+        return [t for t in ORCHESTRATOR_TOOLS
+                if t["function"]["name"] not in ("write_file", "terminal")]
+    return ORCHESTRATOR_TOOLS
 
 # ─── Tool Implementations ────────────────────────────
 
@@ -298,13 +355,35 @@ def tool_web_search(query: str, limit: int = 5) -> str:
         data = resp.json()
         results = data.get("results", [])
         if not results:
-            return f"Sem resultados para: {query}"
+            return f"Nenhum resultado para '{query}'."
         out = []
         for r in results[:limit]:
-            out.append(f"• {r.get('title', 'Sem título')}\n  {r.get('url', '')}\n  {r.get('content', '')[:300]}...")
+            title = r.get("title", "Sem título")
+            url = r.get("url", "")
+            content = r.get("content", "")
+            out.append(f"- {title}\n  {url}\n  {content[:200]}")
         return "\n\n".join(out)
     except Exception as e:
-        return f"[ERRO] Pesquisa falhou: {e}"
+        return f"[ERRO] {e}"
+
+def tool_delegate_to_developer(task: str, repo_path: str = None) -> str:
+    """Envia uma tarefa de codigo ao perfil Developer via server.py dispatch_task."""
+    try:
+        payload = {"target_profile": "dev", "task": task}
+        if repo_path:
+            payload["repo_path"] = repo_path
+        resp = requests.post(
+            f"http://192.168.0.188:5020/api/dispatch",
+            json=payload,
+            timeout=10
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        agent_id = data.get("agent_id", "unknown")
+        jcode_run_id = data.get("jcode_run_id")
+        return f"[OK] Tarefa delegada ao Developer. agent_id={agent_id} jcode_run_id={jcode_run_id or 'n/a'}"
+    except Exception as e:
+        return f"[ERRO] Falha ao delegar ao Developer: {e}"
 
 TOOL_MAP = {
     "read_file": tool_read_file,
@@ -314,6 +393,7 @@ TOOL_MAP = {
     "write_file": tool_write_file,
     "terminal": tool_terminal,
     "web_search": tool_web_search,
+    "delegate_to_developer": tool_delegate_to_developer,
 }
 
 # ─── State Management ──────────────────────────────
@@ -330,6 +410,38 @@ def save_history(history: List[Dict]):
     HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2, ensure_ascii=False)
+
+def load_inbox() -> List[Dict]:
+    """Lê o inbox do orquestrador (orchestrator_inbox.json)."""
+    if INBOX_FILE.exists():
+        try:
+            return json.loads(INBOX_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return []
+
+def save_inbox(inbox: List[Dict]):
+    """Escreve o inbox do orquestrador (orchestrator_inbox.json)."""
+    INBOX_FILE.parent.mkdir(parents=True, exist_ok=True)
+    INBOX_FILE.write_text(json.dumps(inbox, indent=2, ensure_ascii=False), encoding="utf-8")
+
+def prune_inbox(keep: int = MAX_INBOX_KEEP) -> int:
+    """Remove mensagens antigas do inbox, mantendo apenas as últimas `keep`.
+
+    Deve ser chamada APENAS após todas as novas mensagens terem sido processadas
+    com sucesso, para não perder mensagens por processar.
+
+    Retorna o número de mensagens removidas.
+    """
+    inbox = load_inbox()
+    if len(inbox) <= keep:
+        return 0
+    removed = len(inbox) - keep
+    pruned = inbox[-keep:]
+    save_inbox(pruned)
+    print(f"[INBOX CLEANUP] Inbox tinha {len(inbox)} mensagens, mantidas as últimas {keep}. "
+          f"Removidas {removed} mensagens antigas.")
+    return removed
 
 def load_summary() -> str:
     if SUMMARY_FILE.exists():
@@ -362,6 +474,7 @@ SYSTEM_PROMPT_BASE = textwrap.dedent("""\
     - Ler ficheiros e directorias
     - Consultar a wiki Obsidian do projecto
     - Pesquisar na web (modo Orquestrador)
+    - Delegar tarefas de codigo/debugging/infra ao perfil Developer, que executa via jcode
     - Criar/modificar ficheiros (modo Orquestrador)
     - Executar comandos no terminal (modo Orquestrador)
 
@@ -371,6 +484,10 @@ SYSTEM_PROMPT_BASE = textwrap.dedent("""\
     3. Quando usar tools, pensa passo a passo
     4. Se não souberes algo, admite-o
     5. O utilizador pode alternar entre modos Brainstorm e Orquestrador
+    6. Tarefas de codigo, debugging, criar/corrigir ficheiros, scripts, builds, testes, git ou qualquer alteracao ao projecto DEVEM ser delegadas ao Developer via `delegate_to_developer`. Esta e a UNICA forma correcta de mexer em codigo. Nao tentes escrever codigo directamente com write_file nem executar scripts de build/codigo no terminal.
+    7. Usa terminal apenas para comandos de diagnostico/infra leves (status, logs, leitura) e nunca para alterar ficheiros de projecto.
+    8. Usa write_file apenas para notas temporarias ou ficheiros de configuracao simples (ex: markdown, json de notas), nunca para codigo fonte de projectos (.py, .js, .jsx, .ts, .sh, etc.). Para codigo, usa SEMPRE delegate_to_developer.
+    9. Se uma tool que precisas nao estiver disponivel (por exemplo write_file/terminal em modelos locais), isso e intencional: delega ao Developer. Nao procures workarounds.
 
     O projecto actual é o AgentGUI, um dashboard para orquestração de agentes LLM.
     A wiki está em /media/sf_AI_Ecosystem/12_LLM_Wiki/AgentGUI/Wiki/
@@ -382,6 +499,13 @@ def build_messages(history: List[Dict], summary: str, mode: str) -> List[Dict]:
     sys_content += f"\n\n## Modo Actual: {mode.upper()}"
     if mode == "brainstorm":
         sys_content += "\nPodes consultar ficheiros e wiki, mas NÃO podes criar/modificar ficheiros nem executar comandos."
+    elif _is_local_model(MODEL):
+        sys_content += (
+            "\nEstas em modo Orquestrador com um modelo local. As tuas tools sao apenas de "
+            "leitura (read_file, list_files, read_wiki, search_wiki) e delegate_to_developer. "
+            "Nao tens write_file nem terminal — por design. Para mexer em codigo, delega SEMPRE "
+            "ao Developer via delegate_to_developer."
+        )
     else:
         sys_content += "\nTens acesso completo a todas as tools. Podes criar ficheiros, executar comandos, e pesquisar na web."
 
@@ -439,7 +563,7 @@ def process_user_message(text: str, mode: str) -> str:
     # Carregar estado
     history = load_history()
     summary = load_summary()
-    tools = ORCHESTRATOR_TOOLS if mode == "orchestrator" else BRAINSTORM_TOOLS
+    tools = _tools_for(mode, MODEL)
 
     # Adicionar mensagem do utilizador ao histórico
     history.append({"role": "user", "text": text, "time": datetime.now().isoformat()})
@@ -600,6 +724,9 @@ def run_agent():
         sio.emit("orchestrator_response", {"text": response, "mode": mode})
         print(f"[RESP] {response[:100]}...")
 
+        # Após processamento com sucesso, limpar inbox antigo (manter últimas 5)
+        prune_inbox()
+
     @sio.on("orchestrator_mode_change")
     def on_mode_change(data):
         new_mode = data.get("mode", "brainstorm")
@@ -634,7 +761,16 @@ def run_agent():
         return
 
     # Loop principal (poll do inbox como fallback)
+    # Inicializar com o tamanho actual do inbox para NÃO reprocessar
+    # mensagens antigas de sessões anteriores (poupa tokens).
     last_inbox_len = 0
+    if INBOX_FILE.exists():
+        try:
+            old_inbox = json.loads(INBOX_FILE.read_text())
+            last_inbox_len = len(old_inbox)
+            print(f"[INIT] Inbox tem {last_inbox_len} mensagens antigas — a saltar (não reprocessar).")
+        except Exception:
+            pass
     try:
         while True:
             time.sleep(2)
@@ -657,7 +793,10 @@ def run_agent():
                                     response = f"[Erro] {e}"
                                 sio.emit("orchestrator_response", {"text": response, "mode": mode})
                                 print(f"[INBOX RESP] {response[:100]}...")
-                        last_inbox_len = len(inbox)
+                        # Processamento concluído com sucesso: limpar inbox antigo
+                        removed = prune_inbox()
+                        # Após limpeza, last_inbox_len passa a ser o tamanho do inbox pruned
+                        last_inbox_len = MAX_INBOX_KEEP if removed > 0 else len(inbox)
                 except Exception as e:
                     print(f"[WARN] Erro a ler inbox: {e}")
     except KeyboardInterrupt:
@@ -668,7 +807,14 @@ def run_agent():
 def run_fallback():
     """Modo fallback: só polling de inbox.json sem Socket.IO."""
     print("[FALLBACK] Modo polling de inbox.json")
+    # Saltar mensagens antigas já processadas em sessões anteriores.
     last_inbox_len = 0
+    if INBOX_FILE.exists():
+        try:
+            last_inbox_len = len(json.loads(INBOX_FILE.read_text()))
+            print(f"[FALLBACK INIT] Inbox tem {last_inbox_len} mensagens antigas — a saltar.")
+        except Exception:
+            pass
     while True:
         time.sleep(3)
         if not INBOX_FILE.exists():
@@ -700,7 +846,10 @@ def run_fallback():
                             "time": datetime.now().isoformat()
                         })
                         outbox.write_text(json.dumps(entries, indent=2), encoding="utf-8")
-                last_inbox_len = len(inbox)
+                # Processamento concluído com sucesso: limpar inbox antigo
+                removed = prune_inbox()
+                # Após limpeza, last_inbox_len passa a ser o tamanho do inbox pruned
+                last_inbox_len = MAX_INBOX_KEEP if removed > 0 else len(inbox)
         except Exception as e:
             print(f"[WARN] {e}")
 

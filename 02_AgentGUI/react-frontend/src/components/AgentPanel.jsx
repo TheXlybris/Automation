@@ -25,6 +25,17 @@ export default function AgentPanel({ socket }) {
   const [curateResults, setCurateResults] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(null);
   const [modelsList, setModelsList] = useState([]);
+  const [repos, setRepos] = useState([]);
+  const [useJcode, setUseJcode] = useState(() => {
+    try { return localStorage.getItem('dev_use_jcode') === 'true'; } catch { return false; }
+  });
+  const [selectedRepo, setSelectedRepo] = useState(() => {
+    try { return localStorage.getItem('dev_repo') || '/media/sf_AI_Ecosystem/10_Projects/'; } catch { return '/media/sf_AI_Ecosystem/10_Projects/'; }
+  });
+  const [jcodeRunId, setJcodeRunId] = useState(null);
+  const [jcodeStatus, setJcodeStatus] = useState(null);
+  const [jcodeOutput, setJcodeOutput] = useState('');
+  const [showJcodeOutput, setShowJcodeOutput] = useState(false);
 
   // Dreamer-specific state
   const [dreaming, setDreaming] = useState(false);
@@ -70,9 +81,44 @@ export default function AgentPanel({ socket }) {
       .then(r => r.json())
       .then(d => setModelsList(d.models || []))
       .catch(() => {});
+    fetch(`${window.location.origin}/api/jcode/repos`)
+      .then(r => r.json())
+      .then(d => setRepos(d.repos || []))
+      .catch(() => {});
   }, []);
 
-  // Fetch last Dreamer report on mount
+  useEffect(() => {
+    if (!socket) return;
+    const onStream = (msg) => {
+      if (msg.run_id === jcodeRunId) {
+        setJcodeOutput(prev => prev + msg.chunk);
+      }
+    };
+    const onStatus = (msg) => {
+      if (msg.run_id === jcodeRunId) {
+        setJcodeStatus(msg.status);
+        if (msg.status === 'completed' || msg.status === 'error' || msg.status === 'cancelled') {
+          setJcodeRunId(null);
+        }
+      }
+    };
+    const onDispatched = (d) => {
+      if (d.jcode_run_id) {
+        setJcodeRunId(d.jcode_run_id);
+        setJcodeStatus('running');
+        setShowJcodeOutput(true);
+      }
+    };
+    socket.on('jcode_stream', onStream);
+    socket.on('jcode_status', onStatus);
+    socket.on('task_dispatched', onDispatched);
+    return () => {
+      socket.off('jcode_stream', onStream);
+      socket.off('jcode_status', onStatus);
+      socket.off('task_dispatched', onDispatched);
+    };
+  }, [socket, jcodeRunId]);
+
   useEffect(() => {
     refreshLastReport();
   }, []);
@@ -99,15 +145,76 @@ export default function AgentPanel({ socket }) {
     const model = getSavedModel(id);
     const payload = { target_profile: id, task: txt };
     if (model) payload.model = model;
+    if (id === 'dev') {
+      payload.use_jcode = useJcode;
+      payload.repo_path = selectedRepo;
+    }
     socket.emit('dispatch_task', payload);
     setDispatched(id);
     setTasks(prev => ({ ...prev, [id]: '' }));
+    setShowJcodeOutput(true);
+    setJcodeOutput('');
+    setJcodeStatus('running');
     setTimeout(() => setDispatched(null), 3000);
   };
 
-  // ─── Dreamer-specific functions ───
+  const handleJcodeToggle = (e) => {
+    const val = e.target.checked;
+    setUseJcode(val);
+    try { localStorage.setItem('dev_use_jcode', val ? 'true' : 'false'); } catch {}
+  };
 
-  const clearDreamError = () => setDreamError(null);
+  const handleRepoChange = (e) => {
+    const val = e.target.value;
+    setSelectedRepo(val);
+    try { localStorage.setItem('dev_repo', val); } catch {}
+  };
+
+  const handleKillJcode = () => {
+    if (!jcodeRunId || !socket) return;
+    socket.emit('kill_jcode_run', { run_id: jcodeRunId });
+  };
+
+  const handleClearJcodeOutput = () => {
+    setJcodeOutput('');
+    setShowJcodeOutput(false);
+    setJcodeStatus(null);
+  };
+
+  useEffect(() => {
+    if (!socket) return;
+    const onStream = (msg) => {
+      if (msg.run_id === jcodeRunId) {
+        setJcodeOutput(prev => prev + msg.chunk);
+      }
+    };
+    const onStatus = (msg) => {
+      if (msg.run_id === jcodeRunId) {
+        setJcodeStatus(msg.status);
+        if (msg.status === 'completed' || msg.status === 'error' || msg.status === 'cancelled') {
+          setJcodeRunId(null);
+        }
+      }
+    };
+    const onDispatched = (d) => {
+      if (d.jcode_run_id) {
+        setJcodeRunId(d.jcode_run_id);
+        setJcodeStatus('running');
+        setShowJcodeOutput(true);
+      }
+    };
+    socket.on('jcode_stream', onStream);
+    socket.on('jcode_status', onStatus);
+    socket.on('task_dispatched', onDispatched);
+    return () => {
+      socket.off('jcode_stream', onStream);
+      socket.off('jcode_status', onStatus);
+      socket.off('task_dispatched', onDispatched);
+    };
+  }, [socket, jcodeRunId]);
+  useEffect(() => {
+    refreshLastReport();
+  }, []);
 
   const startDream = async () => {
     if (dreaming) return;
@@ -407,6 +514,22 @@ export default function AgentPanel({ socket }) {
           {/* ─── Standard agents: textarea + dispatch ─── */}
           {!isDreamer && !isWiki && (
             <>
+              {ag.id === 'dev' && (
+                <div className="mb-3 p-3 rounded-lg border" style={{ borderColor: 'var(--border-subtle)', background: 'var(--bg-primary)' }}>
+                  <div className="flex items-center gap-2 mb-2">
+                    <span className="text-[11px] font-mono" style={{ color: 'var(--cyber-blue)' }}>Modo: jcode</span>
+                    <span className="text-[9px]" style={{ color: 'var(--text-dim)' }}>(coding agent)</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-mono" style={{ color: 'var(--text-secondary)' }}>Repo:</span>
+                    <select value={selectedRepo} onChange={handleRepoChange} className="agent-input text-[10px] flex-1" style={{ minWidth: 0 }}>
+                      {repos.map(r => (
+                        <option key={r.path} value={r.path}>{r.path}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              )}
               <textarea className="agent-input w-full text-[12px] mb-3" rows={8} placeholder={`Task for ${ag.name}...`} value={tasks[ag.id] || ''} onChange={e => updateTask(ag.id, e.target.value)} onKeyDown={e => { if (e.key==='Enter' && e.ctrlKey) { e.preventDefault(); dispatchTask(ag.id); } }} />
               <div className="flex gap-2">
                 <button onClick={() => dispatchTask(ag.id)} disabled={!(tasks[ag.id] || '').trim()} className="btn-glow flex-1 text-[11px] py-2 px-4 rounded-lg font-mono font-bold border" style={{ background: !(tasks[ag.id] || '').trim() ? 'var(--bg-secondary)' : 'var(--bg-card)', borderColor: !(tasks[ag.id] || '').trim() ? 'var(--border-subtle)' : 'var(--matrix-green)', color: !(tasks[ag.id] || '').trim() ? 'var(--text-muted)' : 'var(--matrix-green)', cursor: !(tasks[ag.id] || '').trim() ? 'not-allowed' : 'pointer', opacity: !(tasks[ag.id] || '').trim() ? 0.5 : 1 }}>
@@ -414,6 +537,20 @@ export default function AgentPanel({ socket }) {
                 </button>
                 <button onClick={() => setFocused(null)} className="btn-glow px-4 py-2 rounded-lg text-xs font-mono border" style={{ background:'var(--bg-hover)', borderColor:'var(--border-subtle)', color: 'var(--text-secondary)' }}>←</button>
               </div>
+              {ag.id === 'dev' && jcodeRunId && (
+                <button onClick={handleKillJcode} disabled={!jcodeRunId} className="mt-2 w-full py-2 rounded-lg text-[11px] font-mono font-bold border" style={{ background: 'rgba(218,54,51,0.15)', borderColor: 'var(--alert-red)', color: 'var(--alert-red)' }}>
+                  Parar jcode
+                </button>
+              )}
+              {ag.id === 'dev' && showJcodeOutput && (
+                <div className="mt-3">
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-[10px] font-mono" style={{ color: 'var(--text-secondary)' }}>Output jcode {jcodeStatus ? `(${jcodeStatus})` : ''}</span>
+                    <button onClick={handleClearJcodeOutput} className="text-[9px]" style={{ color: 'var(--text-dim)' }}>Limpar</button>
+                  </div>
+                  <pre className="bg-black rounded-lg p-3 max-h-64 overflow-auto text-[10px] font-mono text-green-400 whitespace-pre-wrap">{jcodeOutput || '(aguarda output...)'}</pre>
+                </div>
+              )}
               <span className="text-[9px] text-[var(--text-dim)] mt-2 block">Ctrl+Enter para enviar</span>
             </>
           )}
