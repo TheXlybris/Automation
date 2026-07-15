@@ -20,7 +20,7 @@ export const api = {
   kill:      (id)    => request(`/api/agents/${id}/kill`, { method: 'POST' }),
   getAgent:  (id)    => request(`/api/agents/${id}`),
   deleteAgent: (id)  => request(`/api/agents/${id}`, { method: 'DELETE' }),
-  clearFinished: ()  => request('/api/agents/clear-finished', { method: 'POST' }),
+  clearFinished: ()  => request('/api/agents/delete_finished', { method: 'POST' }),
 
   subscribe: (onMessage) => {
     const src = new EventSource(`${API_BASE}/api/stream`);

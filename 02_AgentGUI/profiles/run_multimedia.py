@@ -8,6 +8,7 @@ import sys
 import os
 import json
 import subprocess
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -75,8 +76,13 @@ def main():
     print(f"[{agent_id}] A construir prompt...")
     print(f"[{agent_id}] A invocar hermes chat...")
     
+    # Ensure hermes is findable even if PATH doesn't include ~/.local/bin
+    hermes_bin = str(Path.home() / ".local" / "bin" / "hermes")
+    if not Path(hermes_bin).exists():
+        hermes_bin = "hermes"  # fallback to PATH lookup
+
     # Build hermes chat command
-    cmd = ["hermes", "chat", "-q", prompt, "-Q", "--ignore-rules", "--source", "tool"]
+    cmd = [hermes_bin, "chat", "-q", prompt, "-Q", "--ignore-rules", "--source", "tool"]
     
     # Add model if specified
     if model:
@@ -87,6 +93,7 @@ def main():
         cmd.extend(["-s", ",".join(enabled_skills)])
     
     # Run hermes chat
+    start_time = time.time()
     try:
         result = subprocess.run(
             cmd,
@@ -103,6 +110,34 @@ def main():
         print(f"[{agent_id}] Hermes chat completed with exit code {result.returncode}")
         print(f"[{agent_id}] Output length: {len(output)} chars")
         
+        # Write result.json for loop closure (FASE 2)
+        duration = time.time() - start_time
+        result_data = {
+            "agent_id": agent_id,
+            "profile": PROFILE_NAME,
+            "exit_code": result.returncode,
+            "output": output,
+            "duration": round(duration, 2),
+            "timestamp": datetime.now().isoformat()
+        }
+        result_file = DATA_DIR / f"{agent_id}_result.json"
+        result_file.write_text(json.dumps(result_data, indent=2, ensure_ascii=False))
+
+        # FASE 4: Send result via message bus
+        try:
+            sys.path.insert(0, str(BASE_DIR))
+            from core.message_bus import send_message
+            caller = task_data.get("caller_profile", "orchestrator")
+            send_message(
+                from_profile=PROFILE_NAME,
+                to_profile=caller,
+                content=output[:2000] if output else f"[exit {result.returncode}]",
+                msg_type="result",
+                task_id=agent_id,
+            )
+        except Exception as mb_e:
+            print(f"[{agent_id}] message_bus send failed: {mb_e}")
+        
         # Write done flag
         done_flag = DATA_DIR / f"{agent_id}_done.flag"
         done_flag.write_text(str(result.returncode))
@@ -117,11 +152,33 @@ def main():
             print(output[:5000])
         
     except subprocess.TimeoutExpired:
-        print(f"[{agent_id}] Timeout apos 600s")
+        duration = time.time() - start_time
+        print(f"[{agent_id}] Timeout apos {duration:.0f}s")
+        result_data = {
+            "agent_id": agent_id,
+            "profile": PROFILE_NAME,
+            "exit_code": 1,
+            "output": f"[Timeout after {duration:.0f}s]",
+            "duration": round(duration, 2),
+            "timestamp": datetime.now().isoformat()
+        }
+        result_file = DATA_DIR / f"{agent_id}_result.json"
+        result_file.write_text(json.dumps(result_data, indent=2, ensure_ascii=False))
         done_flag = DATA_DIR / f"{agent_id}_done.flag"
         done_flag.write_text("1")
     except Exception as e:
+        duration = time.time() - start_time
         print(f"[{agent_id}] Erro: {e}")
+        result_data = {
+            "agent_id": agent_id,
+            "profile": PROFILE_NAME,
+            "exit_code": 1,
+            "output": f"[Error: {str(e)}]",
+            "duration": round(duration, 2),
+            "timestamp": datetime.now().isoformat()
+        }
+        result_file = DATA_DIR / f"{agent_id}_result.json"
+        result_file.write_text(json.dumps(result_data, indent=2, ensure_ascii=False))
         done_flag = DATA_DIR / f"{agent_id}_done.flag"
         done_flag.write_text("1")
 

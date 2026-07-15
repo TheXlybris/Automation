@@ -122,28 +122,57 @@ def get_running_sessions() -> list:
         return []
     return [s for s in out.split("\n") if s.startswith(TMUX_PREFIX)]
 
-def sync_running_agents():
+def sync_running_agents() -> list:
     """
     Background sync: mark agents as completed/error if tmux session is gone.
     Checks for done.flag written by the runner to distinguish success from crash.
+    Reads result.json (written by FASE 2 runners) to capture full output.
+    Returns a list of dicts for agents that transitioned to completed/error this cycle:
+        [{agent_id, profile, status, output_summary, duration}, ...]
     Should be called periodically.
     """
     from .state import list_agents, update_agent
     from pathlib import Path
+    import json as _json
 
+    data_dir = Path(__file__).parent.parent / "data"
     running = get_running_sessions()
     active_ids = set(s.replace(TMUX_PREFIX, "") for s in running)
+    completed_this_cycle = []
 
     for agent in list_agents(status_filter="running"):
         if agent["id"] not in active_ids:
             # Session gone — check if runner left a done flag
-            flag_path = Path(__file__).parent.parent / "data" / f"{agent['id']}_done.flag"
+            flag_path = data_dir / f"{agent['id']}_done.flag"
+            result_path = data_dir / f"{agent['id']}_result.json"
+
+            # Try to read result.json first (FASE 2 runners write it)
+            result_data = None
+            if result_path.exists():
+                try:
+                    result_data = _json.loads(result_path.read_text())
+                except Exception:
+                    pass
+
             if flag_path.exists():
                 try:
                     with open(flag_path, 'r') as f:
                         exitcode = int(f.read().strip())
                     flag_path.unlink()
-                    if exitcode == 0:
+
+                    # Use result.json data if available, otherwise infer from flag
+                    if result_data:
+                        output = result_data.get("output", "")
+                        duration = result_data.get("duration", "?")
+                        # Store output in agent state (truncated to 10k by state.py)
+                        update_agent(
+                            agent_id=agent["id"],
+                            status="completed" if exitcode == 0 else "error",
+                            message="Agent terminado",
+                            progress=100,
+                            output_append=output,
+                        )
+                    elif exitcode == 0:
                         update_agent(
                             agent_id=agent["id"],
                             status="completed",
@@ -157,6 +186,14 @@ def sync_running_agents():
                             message="Agent terminado com erro",
                             progress=100
                         )
+
+                    completed_this_cycle.append({
+                        "agent_id": agent["id"],
+                        "profile": agent.get("profile", "?"),
+                        "status": "completed" if exitcode == 0 else "error",
+                        "output_summary": (result_data or {}).get("output", "")[:500] if result_data else "",
+                        "duration": (result_data or {}).get("duration", "?"),
+                    })
                     continue
                 except Exception:
                     pass
@@ -167,3 +204,12 @@ def sync_running_agents():
                 message="Agent terminado (sem flag)",
                 progress=0
             )
+            completed_this_cycle.append({
+                "agent_id": agent["id"],
+                "profile": agent.get("profile", "?"),
+                "status": "error",
+                "output_summary": "",
+                "duration": "?",
+            })
+
+    return completed_this_cycle

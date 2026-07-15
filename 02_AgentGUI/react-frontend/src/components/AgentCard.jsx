@@ -17,6 +17,19 @@ const STATUS_LABELS = {
   cancelled: 'Cancelado',
 };
 
+function formatTimestamp(ts) {
+  if (!ts) return null;
+  try {
+    const d = new Date(ts);
+    return d.toLocaleString('pt-PT', {
+      day: '2-digit', month: '2-digit', year: 'numeric',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+  } catch {
+    return ts;
+  }
+}
+
 function AgentCard({ agent, onDelete }) {
   const [showOutput, setShowOutput] = useState(false);
   const [output, setOutput] = useState('');
@@ -96,6 +109,22 @@ function AgentCard({ agent, onDelete }) {
 
       {/* Goal */}
       <p className="text-sm text-slate-400 mb-4 line-clamp-2">{agent.goal || '(sem descrição)'}</p>
+
+      {/* Timestamps */}
+      <div className="flex flex-col gap-1 mb-3 text-xs font-mono text-slate-500">
+        {agent.started_at && (
+          <div className="flex items-center gap-1.5">
+            <span className="text-slate-600">Inicio:</span>
+            <span>{formatTimestamp(agent.started_at)}</span>
+          </div>
+        )}
+        {agent.finished_at && (
+          <div className="flex items-center gap-1.5">
+            <span className="text-slate-600">Fim:</span>
+            <span>{formatTimestamp(agent.finished_at)}</span>
+          </div>
+        )}
+      </div>
 
       {/* Progress Bar */}
       <div className="mb-4">

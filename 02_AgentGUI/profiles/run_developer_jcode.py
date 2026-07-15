@@ -98,6 +98,34 @@ def main():
         state = get_jcode_status(run_id)
         returncode = state.get("returncode", 130)
 
+    # Write result.json for loop closure (FASE 2)
+    from datetime import datetime
+    result_data = {
+        "agent_id": agent_id,
+        "profile": PROFILE_NAME,
+        "exit_code": returncode,
+        "output": f"[jcode run_id={run_id}] exit={returncode}. See jcode log for full output.",
+        "duration": "jcode",
+        "timestamp": datetime.now().isoformat()
+    }
+    result_file = DATA_DIR / f"{agent_id}_result.json"
+    result_file.write_text(json.dumps(result_data, indent=2, ensure_ascii=False))
+
+    # FASE 4: Send result via message bus
+    try:
+        sys.path.insert(0, str(BASE_DIR))
+        from core.message_bus import send_message
+        caller = task_data.get("caller_profile", "orchestrator")
+        send_message(
+            from_profile=PROFILE_NAME,
+            to_profile=caller,
+            content=result_data["output"][:2000],
+            msg_type="result",
+            task_id=agent_id,
+        )
+    except Exception as mb_e:
+        print(f"[{agent_id}] message_bus send failed: {mb_e}")
+
     done_flag.write_text(str(returncode))
     if returncode == 0:
         print(f"\n[{agent_id}] Tarefa concluida")

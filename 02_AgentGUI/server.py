@@ -105,6 +105,9 @@ def _detect_provider(model_id: str) -> str:
 
 def save_profile_config(profile_id: str, config: dict):
     """Merge new config into existing config (preserves fields not in the update)."""
+    profile_dir = HERMES_PROFILES_DIR / profile_id
+    if not profile_dir.exists():
+        raise ValueError(f"Profile '{profile_id}' does not exist. Cannot create profiles via API.")
     p = get_profile_config_path(profile_id)
     p.parent.mkdir(parents=True, exist_ok=True)
     # Load existing config
@@ -136,6 +139,9 @@ def load_skills_config(profile_id: str) -> dict:
     return {"enabled": [s["name"] for s in all_skills], "disabled": []}
 
 def save_skills_config(profile_id: str, config: dict):
+    profile_dir = HERMES_PROFILES_DIR / profile_id
+    if not profile_dir.exists():
+        raise ValueError(f"Profile '{profile_id}' does not exist. Cannot create profiles via API.")
     p = get_profile_skills_config_path(profile_id)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(config, indent=2), encoding="utf-8")
@@ -403,6 +409,34 @@ def api_agent_output(agent_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/agents/<agent_id>/result")
+def api_agent_result(agent_id):
+    """FASE 2: Return the full result of a completed agent (from result.json or state)."""
+    try:
+        # First try result.json on disk
+        result_path = DATA_DIR / f"{agent_id}_result.json"
+        if result_path.exists():
+            import json as _json
+            result = _json.loads(result_path.read_text())
+            return jsonify(result)
+
+        # Fallback: return what we have in agent state
+        agent = get_agent(agent_id)
+        if not agent:
+            return jsonify({"error": "Agent not found"}), 404
+
+        return jsonify({
+            "agent_id": agent_id,
+            "profile": agent.get("profile", "?"),
+            "status": agent.get("status", "unknown"),
+            "exit_code": 0 if agent.get("status") == "completed" else 1,
+            "output": agent.get("output", ""),
+            "duration": "?",
+            "timestamp": agent.get("finished_at", ""),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/agents/<agent_id>/kill", methods=["POST"])
 def api_kill_agent(agent_id):
     try:
@@ -411,10 +445,23 @@ def api_kill_agent(agent_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/agents/<agent_id>", methods=["DELETE"])
+def api_delete_agent(agent_id):
+    try:
+        kill_agent(agent_id)  # kill if still running
+        deleted = delete_agent(agent_id)
+        if not deleted:
+            return jsonify({"error": "Agent not found"}), 404
+        socketio.emit("agents_updated", {"agents": list_agents()}, broadcast=True)
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/agents/delete_finished", methods=["POST"])
 def api_delete_finished():
     try:
         count = delete_finished_agents()
+        socketio.emit("agents_updated", {"agents": list_agents()}, broadcast=True)
         return jsonify({"deleted": count})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -445,7 +492,10 @@ def api_skills_config(profile_id):
         return jsonify(load_skills_config(profile_id))
     else:
         config = request.json or {}
-        save_skills_config(profile_id, config)
+        try:
+            save_skills_config(profile_id, config)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 404
         return jsonify({"success": True})
 
 # ── Profile config (model selection — REAL) ──
@@ -456,8 +506,34 @@ def api_profile_config(profile_id):
         return jsonify(load_profile_config(profile_id))
     else:
         config = request.json or {}
-        save_profile_config(profile_id, config)
+        try:
+            save_profile_config(profile_id, config)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 404
+        # Also sync model to config.yaml so Hermes Dashboard picks it up
+        _sync_model_to_config_yaml(profile_id, config)
         return jsonify({"success": True})
+
+def _sync_model_to_config_yaml(profile_id: str, config: dict):
+    """Write model+provider from agentgui_config into the profile's config.yaml."""
+    import yaml as _yaml
+    model = config.get("model")
+    provider = config.get("provider", "ollama-cloud")
+    if not model:
+        return
+    config_path = HERMES_PROFILES_DIR / profile_id / "config.yaml"
+    data = {}
+    if config_path.exists():
+        try:
+            data = _yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            data = {}
+    data.setdefault("model", {})
+    data["model"]["default"] = model
+    data["model"]["provider"] = provider
+    data["model"].setdefault("base_url", "https://ollama.com/v1")
+    data["model"].setdefault("context_length", 262144)
+    config_path.write_text(_yaml.dump(data, default_flow_style=False, allow_unicode=True), encoding="utf-8")
 
 # ── Profile SOUL (system prompt editor) ──
 
@@ -813,6 +889,130 @@ def api_jcode_repos():
     return jsonify({"roots": roots, "repos": repos})
 
 
+# ─── Message Bus (FASE 4) ──────────────────────────────
+
+@app.route("/api/messages/send", methods=["POST"])
+def api_message_send():
+    """Send a message from one profile to another via the message bus."""
+    try:
+        data = request.get_json(force=True)
+        from core.message_bus import send_message
+        msg = send_message(
+            from_profile=data.get("from", ""),
+            to_profile=data.get("to", ""),
+            content=data.get("content", ""),
+            msg_type=data.get("type", "result"),
+            task_id=data.get("task_id", ""),
+        )
+        socketio.emit("message_sent", msg)
+        return jsonify(msg)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/messages/<profile>/inbox", methods=["GET"])
+def api_message_inbox(profile):
+    """Get messages addressed to a profile."""
+    try:
+        from core.message_bus import get_inbox
+        unread_only = request.args.get("unread_only", "false").lower() == "true"
+        msgs = get_inbox(profile, unread_only=unread_only)
+        return jsonify({"profile": profile, "count": len(msgs), "messages": msgs})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/messages/<profile>/clear", methods=["POST"])
+def api_message_clear(profile):
+    """Clear all messages for a profile."""
+    try:
+        from core.message_bus import clear_inbox
+        removed = clear_inbox(profile)
+        return jsonify({"removed": removed})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/messages", methods=["GET"])
+def api_messages_all():
+    """Get all messages in the bus (admin/debug)."""
+    try:
+        from core.message_bus import get_all_messages
+        msgs = get_all_messages()
+        return jsonify({"count": len(msgs), "messages": msgs})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ─── Agents Registry (FASE 6) ─────────────────────────
+
+@app.route("/api/agents/registry", methods=["GET"])
+def api_agents_registry():
+    """List all registered agents (Hermes + external)."""
+    try:
+        from core.agent_interface import list_registered_agents
+        agents = list_registered_agents()
+        return jsonify({"count": len(agents), "agents": agents})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/agents/registry", methods=["POST"])
+def api_agents_register():
+    """Register or update an external agent in the registry."""
+    try:
+        data = request.get_json(force=True)
+        from core.agent_interface import register_agent_entry
+        entry = register_agent_entry(
+            name=data.get("name", ""),
+            agent_type=data.get("type", "external_cli"),
+            capabilities=data.get("capabilities", []),
+            model=data.get("model", ""),
+            endpoint=data.get("endpoint", ""),
+            command=data.get("command", ""),
+            enabled=data.get("enabled", True),
+        )
+        return jsonify(entry)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/agents/registry/<agent_name>", methods=["DELETE"])
+def api_agents_unregister(agent_name):
+    """Remove an agent from the registry."""
+    try:
+        from core.agent_interface import load_registry, save_registry
+        registry = load_registry()
+        before = len(registry.get("agents", []))
+        registry["agents"] = [a for a in registry.get("agents", []) if a["name"] != agent_name]
+        save_registry(registry)
+        removed = before - len(registry["agents"])
+        return jsonify({"removed": removed, "name": agent_name})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/agents/route", methods=["POST"])
+def api_agents_route():
+    """Route a task to the best available agent (FASE 6)."""
+    try:
+        data = request.get_json(force=True)
+        task = data.get("task", "")
+        preferred = data.get("preferred_agent")
+        from core.agent_interface import route_task
+        agent = route_task(task, preferred)
+        if not agent:
+            return jsonify({"error": "No suitable agent found"}), 404
+        return jsonify({
+            "agent_type": agent.agent_type,
+            "dispatched": True,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ─── Socket.IO Events ─────────────────────────────────
 
 @socketio.on("connect")
@@ -854,9 +1054,10 @@ def _dispatch_task_impl(data: dict) -> dict:
     repo_path = data.get("repo_path")
     tool_profile = data.get("tool_profile")
     timeout = int(data.get("timeout", 600))
+    caller_profile = data.get("caller_profile", "orchestrator")  # FASE 4: track who dispatched
 
-    profile_map = {"dev": "developer", "mm": "multimedia", "res": "researcher", "wiki": "wiki", "dreamer": "dreamer"}
-    profile = profile_map.get(target_profile, target_profile)
+    # IDs now match profile names directly (1:1, no mapping needed)
+    profile = target_profile
 
     agent_id = f"{profile}_{uuid.uuid4().hex[:8]}"
 
@@ -877,6 +1078,7 @@ def _dispatch_task_impl(data: dict) -> dict:
         "repo_path": repo_path,
         "tool_profile": tool_profile,
         "timeout": timeout,
+        "caller_profile": caller_profile,  # FASE 4: so runners know where to send result
         "created_at": datetime.now().isoformat()
     }
     task_file.write_text(json.dumps(task_data, indent=2, ensure_ascii=False))
@@ -919,6 +1121,12 @@ def _dispatch_task_impl(data: dict) -> dict:
         "timestamp": datetime.now().isoformat(),
         "status": "dispatched"
     })
+
+    # Broadcast updated agents list so all tabs (COMANDO, TAREFAS) see the new agent immediately
+    try:
+        socketio.emit("agents_updated", {"agents": list_agents()})
+    except Exception:
+        pass  # don't fail the dispatch if socket emit fails
 
     return {
         "id": agent_id,
@@ -1047,7 +1255,7 @@ def handle_send_input(data):
 
 @socketio.on("refresh_agents")
 def handle_refresh():
-    emit("agents_list", list_agents(), broadcast=True)
+    emit("agents_updated", {"agents": list_agents()}, broadcast=True)
 
 # ─── Background Threads ───────────────────────────────
 # ─── Background Threads ───────────────────────────────
@@ -1073,13 +1281,46 @@ def resources_worker():
         time.sleep(2)
 
 def sync_worker():
-    """Sync agent states every 5 seconds."""
+    """Sync agent states every 5 seconds. Emits agent_completed for finished agents (FASE 2)."""
     while True:
         try:
-            sync_running_agents()
+            completed = sync_running_agents()
+            for c in completed:
+                # Broadcast completion event to all connected clients
+                socketio.emit("agent_completed", c)
+                # Broadcast updated agents list so TAREFAS/COMANDO tabs update in real-time
+                try:
+                    socketio.emit("agents_updated", {"agents": list_agents()})
+                except Exception:
+                    pass
+                # FASE A: emit final stream output for Command Center
+                agent_id = c.get("agent_id", "")
+                if agent_id:
+                    agent = get_agent(agent_id)
+                    final_output = (agent or {}).get("output", c.get("output_summary", ""))
+                    socketio.emit("agent_stream", {
+                        "agent_id": agent_id,
+                        "profile": c.get("profile", "?"),
+                        "output": final_output,
+                        "status": c.get("status", "completed"),
+                        "timestamp": datetime.now().isoformat(),
+                        "is_final": True,
+                    })
+                    # Clean stream cache
+                    _stream_cache.pop(agent_id, None)
+                try:
+                    print(f"[sync_worker] Agent {c['agent_id']} → {c['status']} ({c['duration']}s)")
+                except Exception:
+                    pass  # stdout pipe may be broken — don't kill the worker
         except Exception as e:
-            print(f"[sync_worker] Error: {e}")
-        time.sleep(5)
+            try:
+                print(f"[sync_worker] Error: {e}")
+            except Exception:
+                pass  # swallow print errors to keep worker alive
+        try:
+            time.sleep(5)
+        except Exception:
+            pass  # sleep should never kill the worker
 
 def cron_scheduler_worker():
     """Check cron tasks every 30 seconds."""
@@ -1161,8 +1402,52 @@ def orchestrator_subprocess_worker():
 
 # ─── Start background threads ─────────────────────────
 
+# FASE A: Command Center — live terminal streaming
+_stream_cache = {}  # agent_id → last output hash
+
+def stream_worker():
+    """Stream tmux pane output for all running agents via Socket.IO every 1.5s."""
+    while True:
+        try:
+            from core.runner import get_agent_output, _session_exists, TMUX_PREFIX
+            running = [a for a in list_agents() if a.get("status") == "running"]
+            for agent in running:
+                agent_id = agent["id"]
+                session = f"{TMUX_PREFIX}{agent_id}"
+                if not _session_exists(session):
+                    continue
+                output = get_agent_output(agent_id, lines=50)
+                if not output:
+                    continue
+                # Hash to detect changes
+                import hashlib
+                h = hashlib.md5(output.encode("utf-8", errors="replace")).hexdigest()
+                if _stream_cache.get(agent_id) == h:
+                    continue  # no change
+                _stream_cache[agent_id] = h
+                try:
+                    socketio.emit("agent_stream", {
+                        "agent_id": agent_id,
+                        "profile": agent.get("profile", "?"),
+                        "output": output,
+                        "status": "running",
+                        "timestamp": datetime.now().isoformat(),
+                    })
+                except Exception:
+                    pass  # don't kill the worker
+        except Exception as e:
+            try:
+                print(f"[stream_worker] Error: {e}")
+            except Exception:
+                pass
+        try:
+            time.sleep(1.5)
+        except Exception:
+            pass
+
 threading.Thread(target=resources_worker, daemon=True).start()
 threading.Thread(target=sync_worker, daemon=True).start()
+threading.Thread(target=stream_worker, daemon=True).start()
 threading.Thread(target=cron_scheduler_worker, daemon=True).start()
 threading.Thread(target=orchestrator_subprocess_worker, daemon=True).start()
 

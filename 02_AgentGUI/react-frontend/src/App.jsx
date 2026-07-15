@@ -7,6 +7,7 @@ import ModelRecommendations from './components/ModelRecommendations';
 import TasksView from './components/TasksView';
 import AgentHistory from './components/AgentHistory';
 import MediaTimeline from './components/MediaTimeline';
+import CommandCenter from './components/CommandCenter';
 
 import CascadeWaterInpaint from './components/CascadeWaterInpaint';
 import ImageAnimator from './components/ImageAnimator';
@@ -15,6 +16,7 @@ import MusicGenerator from './components/MusicGenerator';
 
 const NAV_ITEMS = [
   { key: 'agentes', label: 'AGENTES', icon: '🤖', title: 'Agentes & Recursos' },
+  { key: 'comando', label: 'COMANDO', icon: '📡', title: 'Command Center — Live Terminal Feed' },
   { key: 'tarefas', label: 'TAREFAS', icon: '📋', title: 'Gestao de Tarefas' },
   { key: 'produzir', label: 'PRODUZIR', icon: '🎨', title: 'Image + Video + Music' },
   { key: 'media',   label: 'MEDIA',   icon: '🎬', title: 'Timeline Video/Musica' },
@@ -78,8 +80,25 @@ function App() {
       if (data.agents) setAgents(data.agents);
     });
 
+    s.on('agents_list', (data) => {
+      // Legacy event name — some server versions emit this
+      const agents = Array.isArray(data) ? data : (data.agents || []);
+      setAgents(agents);
+    });
+
     s.on('connected', (data) => {
       if (data.agents) setAgents(data.agents);
+    });
+
+    s.on('task_dispatched', () => {
+      // A new task was dispatched — fetch updated agents list immediately
+      fetch(`${window.location.origin}/api/agents`)
+        .then(r => r.json())
+        .then(d => {
+          const list = Array.isArray(d) ? d : (d.agents || []);
+          setAgents(list);
+        })
+        .catch(err => console.error('Error fetching agents after dispatch:', err));
     });
 
     setSocket(s);
@@ -225,100 +244,93 @@ function App() {
           <SystemResources socket={socket} compact={true} />
         </div>
 
-        {/* Page Content */}
+        {/* Page Content — all tabs kept mounted (display:none) to preserve state across tab switches */}
         <main className="relative z-10 flex-1 overflow-auto" style={{ paddingTop: 54 }}>
-          <div className="py-6 space-y-4">
-            {activeTab === 'produzir' && (
-              <div className="space-y-4">
-                {/* IMAGE GENERATOR */}
-                <SectionHeader
-                  title="IMAGE GENERATOR"
-                  emoji="🖼️"
-                  colorVar="--amber-warn"
-                  collapsed={collapsedSections.imageGen}
-                  onToggle={() => toggleSection('imageGen')}
-                >
-                  <ImageGenerator onImageGenerated={(img) => {
-                    setGeneratedImage(img);
-                    console.log('Image generated:', img);
-                  }} />
-                </SectionHeader>
+          {/* AGENTES */}
+          <div className="py-6 space-y-4" style={{ display: activeTab === 'agentes' ? 'block' : 'none' }}>
+            <section className="mb-6">
+              <OrchestratorChat socket={socket} />
+            </section>
+            <section className="mb-6">
+              <AgentPanel socket={socket} />
+            </section>
+            <section className="mb-6">
+              <ModelRecommendations socket={socket} />
+            </section>
+          </div>
 
-                {/* MUSIC GENERATOR */}
-                <SectionHeader
-                  title="MUSIC GENERATOR"
-                  emoji="🎵"
-                  colorVar="--cyber-blue"
-                  collapsed={collapsedSections.musicGen}
-                  onToggle={() => toggleSection('musicGen')}
-                >
-                  <MusicGenerator onMusicGenerated={(music) => {
-                    setGeneratedMusic(music);
-                    console.log('Music generated:', music);
-                  }} />
-                </SectionHeader>
+          {/* COMANDO */}
+          <div style={{ display: activeTab === 'comando' ? 'block' : 'none' }}>
+            <CommandCenter socket={socket} />
+          </div>
 
-                {/* IMAGE ANIMATOR — existing ImageAnimator component */}
-                <SectionHeader
-                  title="IMAGE ANIMATOR — Efeitos Atmosfericos"
-                  emoji="✨"
-                  colorVar="--cyber-blue"
-                  collapsed={collapsedSections.imageAnim}
-                  onToggle={() => toggleSection('imageAnim')}
-                >
-                  <ImageAnimator onVideoToPool={(fn) => {
-                    console.log('Animated video added to pool:', fn);
-                  }} socket={socket} />
-                </SectionHeader>
+          {/* TAREFAS */}
+          <div className="py-6 space-y-4" style={{ display: activeTab === 'tarefas' ? 'block' : 'none' }}>
+            <TasksView socket={socket} agents={agents} />
+          </div>
 
-                {/* CASCADE WATER INPAINT — new component */}
-                <SectionHeader
-                  title="INPAINT CASCATA — Efeito de Agua"
-                  emoji="💧"
-                  colorVar="--matrix-green"
-                  collapsed={collapsedSections.cascadeWater}
-                  onToggle={() => toggleSection('cascadeWater')}
-                >
-                  <CascadeWaterInpaint onVideoToPool={(fn) => {
-                    console.log('Cascade video added to pool:', fn);
-                  }} />
-                </SectionHeader>
-              </div>
-            )}
+          {/* PRODUZIR */}
+          <div className="py-6 space-y-4" style={{ display: activeTab === 'produzir' ? 'block' : 'none' }}>
+            <SectionHeader
+              title="IMAGE GENERATOR"
+              emoji="🖼️"
+              colorVar="--amber-warn"
+              collapsed={collapsedSections.imageGen}
+              onToggle={() => toggleSection('imageGen')}
+            >
+              <ImageGenerator onImageGenerated={(img) => {
+                setGeneratedImage(img);
+                console.log('Image generated:', img);
+              }} />
+            </SectionHeader>
+            <SectionHeader
+              title="MUSIC GENERATOR"
+              emoji="🎵"
+              colorVar="--cyber-blue"
+              collapsed={collapsedSections.musicGen}
+              onToggle={() => toggleSection('musicGen')}
+            >
+              <MusicGenerator onMusicGenerated={(music) => {
+                setGeneratedMusic(music);
+                console.log('Music generated:', music);
+              }} />
+            </SectionHeader>
+            <SectionHeader
+              title="IMAGE ANIMATOR — Efeitos Atmosfericos"
+              emoji="✨"
+              colorVar="--cyber-blue"
+              collapsed={collapsedSections.imageAnim}
+              onToggle={() => toggleSection('imageAnim')}
+            >
+              <ImageAnimator onVideoToPool={(fn) => {
+                console.log('Animated video added to pool:', fn);
+              }} socket={socket} />
+            </SectionHeader>
+            <SectionHeader
+              title="INPAINT CASCATA — Efeito de Agua"
+              emoji="💧"
+              colorVar="--matrix-green"
+              collapsed={collapsedSections.cascadeWater}
+              onToggle={() => toggleSection('cascadeWater')}
+            >
+              <CascadeWaterInpaint onVideoToPool={(fn) => {
+                console.log('Cascade video added to pool:', fn);
+              }} />
+            </SectionHeader>
+          </div>
 
-            {activeTab === 'media' && (
-              <div style={{
-                position: 'fixed',
-                top: 96,
-                left: sidebarCollapsed ? 56 : 192,
-                right: 0,
-                bottom: 0,
-                padding: 12,
-                overflow: 'hidden',
-              }}>
-                <MediaTimeline socket={socket} />
-              </div>
-            )}
-
-            {activeTab === 'agentes' && (
-              <div>
-                <section className="mb-6">
-                  <OrchestratorChat socket={socket} />
-                </section>
-
-                <section className="mb-6">
-                  <AgentPanel socket={socket} />
-                </section>
-
-                <section className="mb-6">
-                  <ModelRecommendations socket={socket} />
-                </section>
-              </div>
-            )}
-
-            {activeTab === 'tarefas' && (
-              <TasksView socket={socket} agents={agents} />
-            )}
+          {/* MEDIA */}
+          <div style={{
+            display: activeTab === 'media' ? 'block' : 'none',
+            position: 'fixed',
+            top: 96,
+            left: sidebarCollapsed ? 56 : 192,
+            right: 0,
+            bottom: 0,
+            padding: 12,
+            overflow: 'hidden',
+          }}>
+            <MediaTimeline socket={socket} />
           </div>
         </main>
       </div>

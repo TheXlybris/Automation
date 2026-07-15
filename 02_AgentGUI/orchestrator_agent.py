@@ -191,22 +191,28 @@ ORCHESTRATOR_TOOLS = BRAINSTORM_TOOLS + [
     {
         "type": "function",
         "function": {
-            "name": "delegate_to_developer",
+            "name": "delegate_to_agent",
             "description": (
-                "A UNICA forma de criar, modificar, corrigir ou investigar codigo fonte, "
-                "scripts de projecto, configuracoes tecnicas ou infraestrutura. Delega a tarefa "
-                "ao perfil Developer do AgentGUI, que executa via jcode. "
-                "USO OBRIGATORIO para: escrever/editar ficheiros de codigo (.py, .js, .jsx, .ts, .sh, etc.), "
-                "corrigir bugs, refactors, builds, tests, git, ou qualquer alteracao ao projecto. "
-                "Nao tentes fazer isto com write_file ou terminal — delega SEMPRE ao Developer."
+                "Delega uma tarefa a um perfil especializado do AgentGUI. O perfil executa "
+                "assincronamente e o resultado volta automaticamente via agent_completed. "
+                "USO OBRIGATORIO para qualquer trabalho especializado — nao tentes fazer com "
+                "write_file ou terminal o que deve ser delegado. "
+                "Mapeamento: developer=codigo/debug/builds/git, multimedia=ComfyUI/video/audio/imagens, "
+                "researcher=pesquisa web/papers/analise de dados, wiki=wiki/Obsidian/documentacao, "
+                "dreamer=audits/testing/codebase inspection."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "task": {"type": "string", "description": "Descricao detalhada da tarefa de codigo"},
-                    "repo_path": {"type": "string", "description": "Caminho absoluto do repositorio onde o codigo deve ser alterado (opcional; se omitido, usa o default)"}
+                    "profile": {
+                        "type": "string",
+                        "description": "Perfil destino: developer, multimedia, researcher, wiki, dreamer",
+                        "enum": ["developer", "multimedia", "researcher", "wiki", "dreamer"]
+                    },
+                    "task": {"type": "string", "description": "Descricao detalhada da tarefa"},
+                    "repo_path": {"type": "string", "description": "Caminho absoluto do repositorio (opcional; so relevante para developer)"}
                 },
-                "required": ["task"]
+                "required": ["profile", "task"]
             }
         }
     }
@@ -231,7 +237,7 @@ def _tools_for(mode: str, model: str = None) -> List[Dict]:
     - orchestrator + modelo cloud: ORCHESTRATOR_TOOLS completo.
     - orchestrator + modelo local: ORCHESTRATOR_TOOLS SEM write_file nem
       terminal. Assim o modelo local só consegue investigar (read/list/wiki)
-      e delegar código via delegate_to_developer — não lhe resta write_file
+      e delegar código via delegate_to_agent — não lhe resta write_file
       nem terminal como caminho errado para "escrever código".
     """
     if mode == "brainstorm":
@@ -366,10 +372,17 @@ def tool_web_search(query: str, limit: int = 5) -> str:
     except Exception as e:
         return f"[ERRO] {e}"
 
-def tool_delegate_to_developer(task: str, repo_path: str = None) -> str:
-    """Envia uma tarefa de codigo ao perfil Developer via server.py dispatch_task."""
+def tool_delegate_to_agent(profile: str, task: str, repo_path: str = None) -> str:
+    """Delega uma tarefa a um perfil especializado via server.py dispatch."""
+    valid_profiles = {"developer", "multimedia", "researcher", "wiki", "dreamer"}
+    if profile not in valid_profiles:
+        return f"[ERRO] Perfil invalido: {profile}. Validos: {', '.join(sorted(valid_profiles))}"
+    if not task.strip():
+        return "[ERRO] Task nao pode ser vazia."
     try:
-        payload = {"target_profile": "dev", "task": task}
+        # server.py expects "dev" for developer, full name for others
+        target = "dev" if profile == "developer" else profile
+        payload = {"target_profile": target, "task": task}
         if repo_path:
             payload["repo_path"] = repo_path
         resp = requests.post(
@@ -379,11 +392,12 @@ def tool_delegate_to_developer(task: str, repo_path: str = None) -> str:
         )
         resp.raise_for_status()
         data = resp.json()
-        agent_id = data.get("agent_id", "unknown")
+        agent_id = data.get("agent_id", data.get("id", "unknown"))
         jcode_run_id = data.get("jcode_run_id")
-        return f"[OK] Tarefa delegada ao Developer. agent_id={agent_id} jcode_run_id={jcode_run_id or 'n/a'}"
+        extra = f" jcode_run_id={jcode_run_id}" if jcode_run_id else ""
+        return f"[OK] Tarefa delegada a {profile}. agent_id={agent_id}{extra}. O resultado chega via agent_completed."
     except Exception as e:
-        return f"[ERRO] Falha ao delegar ao Developer: {e}"
+        return f"[ERRO] Falha ao delegar a {profile}: {e}"
 
 TOOL_MAP = {
     "read_file": tool_read_file,
@@ -393,7 +407,7 @@ TOOL_MAP = {
     "write_file": tool_write_file,
     "terminal": tool_terminal,
     "web_search": tool_web_search,
-    "delegate_to_developer": tool_delegate_to_developer,
+    "delegate_to_agent": tool_delegate_to_agent,
 }
 
 # ─── State Management ──────────────────────────────
@@ -484,10 +498,11 @@ SYSTEM_PROMPT_BASE = textwrap.dedent("""\
     3. Quando usar tools, pensa passo a passo
     4. Se não souberes algo, admite-o
     5. O utilizador pode alternar entre modos Brainstorm e Orquestrador
-    6. Tarefas de codigo, debugging, criar/corrigir ficheiros, scripts, builds, testes, git ou qualquer alteracao ao projecto DEVEM ser delegadas ao Developer via `delegate_to_developer`. Esta e a UNICA forma correcta de mexer em codigo. Nao tentes escrever codigo directamente com write_file nem executar scripts de build/codigo no terminal.
+    6. Delega tarefas especializadas via `delegate_to_agent(profile, task)`. Mapeamento: developer=codigo/debug/builds/git, multimedia=ComfyUI/video/audio/imagens, researcher=pesquisa web/papers/analise, wiki=wiki/Obsidian/docs, dreamer=audits/testing/inspecao de codebase. Esta e a UNICA forma correcta de delegar trabalho especializado.
     7. Usa terminal apenas para comandos de diagnostico/infra leves (status, logs, leitura) e nunca para alterar ficheiros de projecto.
-    8. Usa write_file apenas para notas temporarias ou ficheiros de configuracao simples (ex: markdown, json de notas), nunca para codigo fonte de projectos (.py, .js, .jsx, .ts, .sh, etc.). Para codigo, usa SEMPRE delegate_to_developer.
-    9. Se uma tool que precisas nao estiver disponivel (por exemplo write_file/terminal em modelos locais), isso e intencional: delega ao Developer. Nao procures workarounds.
+    8. Usa write_file apenas para notas temporarias ou ficheiros de configuracao simples (ex: markdown, json de notas), nunca para codigo fonte de projectos (.py, .js, .jsx, .ts, .sh, etc.). Para codigo, usa SEMPRE delegate_to_agent com profile=developer.
+    9. Se uma tool que precisas nao estiver disponivel (por exemplo write_file/terminal em modelos locais), isso e intencional: delega via delegate_to_agent. Nao procures workarounds.
+    10. Quando recebes um evento [RESULT from <profile>] no inbox, processa-o: avalia o resultado, decide se a tarefa esta completa ou precisa re-delegar, e reporta ao utilizador.
 
     O projecto actual é o AgentGUI, um dashboard para orquestração de agentes LLM.
     A wiki está em /media/sf_AI_Ecosystem/12_LLM_Wiki/AgentGUI/Wiki/
@@ -502,9 +517,9 @@ def build_messages(history: List[Dict], summary: str, mode: str) -> List[Dict]:
     elif _is_local_model(MODEL):
         sys_content += (
             "\nEstas em modo Orquestrador com um modelo local. As tuas tools sao apenas de "
-            "leitura (read_file, list_files, read_wiki, search_wiki) e delegate_to_developer. "
+            "leitura (read_file, list_files, read_wiki, search_wiki) e delegate_to_agent. "
             "Nao tens write_file nem terminal — por design. Para mexer em codigo, delega SEMPRE "
-            "ao Developer via delegate_to_developer."
+            "ao Developer via delegate_to_agent com profile=developer."
         )
     else:
         sys_content += "\nTens acesso completo a todas as tools. Podes criar ficheiros, executar comandos, e pesquisar na web."
@@ -737,6 +752,59 @@ def run_agent():
             "mode": new_mode
         })
 
+    @sio.on("agent_completed")
+    def on_agent_completed(data):
+        """FASE 2: Receive result from a dispatched agent and inject into context."""
+        agent_id = data.get("agent_id", "?")
+        profile = data.get("profile", "?")
+        status = data.get("status", "completed")
+        output_summary = data.get("output_summary", "")
+        duration = data.get("duration", "?")
+
+        print(f"[AGENT COMPLETED] {profile}/{agent_id} → {status} ({duration}s)")
+
+        # Inject result into inbox so it's processed in the next loop iteration
+        inbox = load_inbox()
+        result_msg = (
+            f"[RESULT from {profile}] Task dispatched as {agent_id} → "
+            f"Status: {status}. Duration: {duration}s.\n"
+            f"Output: {output_summary[:1000]}"
+        )
+        inbox.append({
+            "role": "system",
+            "text": result_msg,
+            "time": datetime.now().isoformat(),
+            "source": "agent_completed",
+            "agent_id": agent_id,
+        })
+        save_inbox(inbox)
+        print(f"[INBOX] Result from {profile} injected into inbox")
+
+    @sio.on("message_sent")
+    def on_message_sent(data):
+        """FASE 4: Receive message bus events in real time."""
+        to_profile = data.get("to", "")
+        if to_profile != "orchestrator":
+            return  # Only process messages addressed to us
+        msg_type = data.get("type", "result")
+        from_profile = data.get("from", "?")
+        content = data.get("content", "")
+        task_id = data.get("task_id", "")
+
+        print(f"[MESSAGE BUS] from {from_profile}: {msg_type} (task={task_id})")
+
+        # Inject into inbox for processing
+        inbox = load_inbox()
+        inbox.append({
+            "role": "system",
+            "text": f"[MESSAGE from {from_profile}] type={msg_type} task={task_id}\n{content[:1000]}",
+            "time": datetime.now().isoformat(),
+            "source": "message_bus",
+            "msg_id": data.get("id", ""),
+        })
+        save_inbox(inbox)
+        print(f"[INBOX] Message from {from_profile} injected into inbox")
+
     @sio.on("orchestrator_summarize")
     def on_summarize(data):
         history = load_history()
@@ -805,8 +873,8 @@ def run_agent():
         sio.disconnect()
 
 def run_fallback():
-    """Modo fallback: só polling de inbox.json sem Socket.IO."""
-    print("[FALLBACK] Modo polling de inbox.json")
+    """Modo fallback: só polling de inbox.json + message bus sem Socket.IO."""
+    print("[FALLBACK] Modo polling de inbox.json + message_bus")
     # Saltar mensagens antigas já processadas em sessões anteriores.
     last_inbox_len = 0
     if INBOX_FILE.exists():
@@ -815,8 +883,35 @@ def run_fallback():
             print(f"[FALLBACK INIT] Inbox tem {last_inbox_len} mensagens antigas — a saltar.")
         except Exception:
             pass
+    # FASE 4: Track seen message bus IDs to avoid reprocessing
+    seen_msg_ids = set()
     while True:
         time.sleep(3)
+
+        # FASE 4: Poll message bus for orchestrator inbox
+        try:
+            resp = requests.get(f"{SERVER_URL}/api/messages/orchestrator/inbox", timeout=5)
+            if resp.status_code == 200:
+                bus_data = resp.json()
+                for msg in bus_data.get("messages", []):
+                    msg_id = msg.get("id", "")
+                    if msg_id and msg_id not in seen_msg_ids:
+                        seen_msg_ids.add(msg_id)
+                        from_p = msg.get("from", "?")
+                        msg_type = msg.get("type", "result")
+                        content = msg.get("content", "")
+                        task_id = msg.get("task_id", "")
+                        text = f"[MESSAGE from {from_p}] type={msg_type} task={task_id}\n{content[:1000]}"
+                        print(f"[BUS FALLBACK] {from_p}: {msg_type}")
+                        mode = load_mode()
+                        try:
+                            response = process_user_message(text, mode)
+                        except Exception as e:
+                            response = f"[Erro] {e}"
+                        print(f"[BUS FALLBACK RESP] {response[:200]}...")
+        except Exception as e:
+            pass  # Server might not be running
+
         if not INBOX_FILE.exists():
             continue
         try:

@@ -2,15 +2,76 @@ import { useState, useEffect, useRef } from 'react';
 import SettingsModal from './SettingsModal';
 
 const DEFAULT_AGENTS = [
-  { id:'dev',   name:'Developer',     emoji:'💻', desc:'Coding, debugging, infra',        color:'#00d4ff', status:'Standby' },
-  { id:'mm',    name:'Multimedia',    emoji:'🎨', desc:'Images, video, audio, ComfyUI',   color:'#ff7b00', status:'Standby' },
-  { id:'res',   name:'Researcher',    emoji:'🔬', desc:'Web research, papers, synthesis', color:'#00ff41', status:'Standby' },
-  { id:'wiki',  name:'Wiki Curator',  emoji:'📚', desc:'Obsidian, LLM Wiki, memory',     color:'#ffb800', status:'Standby' },
-  { id:'dream', name:'Dreamer',       emoji:'🌙', desc:'Self-improvement, audits, wiki lint, skill gaps', color:'#c084fc', status:'Standby' },
+  { id:'developer',   name:'Developer',     emoji:'💻', desc:'Coding, debugging, infra',        color:'#00d4ff', status:'Standby' },
+  { id:'multimedia',  name:'Multimedia',    emoji:'🎨', desc:'Images, video, audio, ComfyUI',   color:'#ff7b00', status:'Standby' },
+  { id:'researcher',  name:'Researcher',    emoji:'🔬', desc:'Web research, papers, synthesis', color:'#00ff41', status:'Standby' },
+  { id:'wiki',        name:'Wiki Curator',  emoji:'📚', desc:'Obsidian, LLM Wiki, memory',     color:'#ffb800', status:'Standby' },
+  { id:'dreamer',     name:'Dreamer',       emoji:'🌙', desc:'Self-improvement, audits, wiki lint, skill gaps', color:'#c084fc', status:'Standby' },
 ];
 
 const STORAGE_KEY = (id) => `agent_model_${id}`;
 const DREAM_TIMEOUT_SEC = 45; // assume failure if no progress change in 45s
+
+// ─── ConversationLog component ──────────────────────
+function ConversationLog({ profileId, logs, status, onClear, logEndRef }) {
+  useEffect(() => {
+    if (logEndRef.current) logEndRef.current.scrollIntoView({ behavior: 'smooth' });
+  }, [logs]);
+
+  return (
+    <div className="mt-3 mb-3">
+      <div className="flex items-center justify-between mb-1">
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] font-mono" style={{ color: 'var(--text-secondary)' }}>Conversa</span>
+          {status === 'running' && (
+            <span className="flex items-center gap-1 text-[9px] font-mono" style={{ color: 'var(--matrix-green)' }}>
+              <span className="w-1.5 h-1.5 rounded-full bg-[var(--matrix-green)] animate-pulse" />
+              a processar...
+            </span>
+          )}
+          {status === 'completed' && (
+            <span className="text-[9px] font-mono" style={{ color: 'var(--matrix-green)' }}>concluido</span>
+          )}
+          {status === 'error' && (
+            <span className="text-[9px] font-mono" style={{ color: 'var(--alert-red)' }}>erro</span>
+          )}
+        </div>
+        {logs.length > 0 && (
+          <button onClick={onClear} className="text-[9px] font-mono px-2 py-0.5 rounded border hover:bg-[var(--bg-hover)]" style={{ borderColor: 'var(--border-subtle)', color: 'var(--text-muted)' }} title="Limpar conversa">Limpar</button>
+        )}
+      </div>
+      {logs.length > 0 ? (
+        <div className="rounded-lg border overflow-auto" style={{ borderColor: 'var(--border-subtle)', background: 'var(--bg-primary)', maxHeight: '400px' }}>
+          {logs.map((entry, i) => (
+            <div key={i} className="px-3 py-2 border-b" style={{ borderColor: 'var(--border-subtle)' }}>
+              {entry.role === 'user' ? (
+                <div>
+                  <span className="text-[9px] font-mono font-bold" style={{ color: 'var(--cyber-blue)' }}>USER</span>
+                  <span className="text-[9px] font-mono ml-2" style={{ color: 'var(--text-dim)' }}>{new Date(entry.ts).toLocaleTimeString()}</span>
+                  <pre className="text-[11px] font-mono mt-1 whitespace-pre-wrap" style={{ color: 'var(--text-secondary)' }}>{entry.text}</pre>
+                </div>
+              ) : (
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[9px] font-mono font-bold" style={{ color: entry.is_final ? 'var(--matrix-green)' : 'var(--amber-warn)' }}>AGENT</span>
+                    <span className="text-[9px] font-mono" style={{ color: 'var(--text-dim)' }}>{new Date(entry.ts).toLocaleTimeString()}</span>
+                    {entry.is_final && <span className="text-[8px] font-mono" style={{ color: 'var(--matrix-green)' }}>final</span>}
+                  </div>
+                  <pre className="text-[10px] font-mono mt-1 whitespace-pre-wrap overflow-auto" style={{ color: 'var(--text-primary)', maxHeight: '300px' }}>{entry.text}</pre>
+                </div>
+              )}
+            </div>
+          ))}
+          <div ref={logEndRef} />
+        </div>
+      ) : (
+        <div className="rounded-lg border flex items-center justify-center text-[10px] font-mono" style={{ borderColor: 'var(--border-subtle)', background: 'var(--bg-primary)', color: 'var(--text-dim)', height: '60px' }}>
+          Sem conversa. Envia uma tarefa para comecar.
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function AgentPanel({ socket }) {
   const [agents] = useState(DEFAULT_AGENTS);
@@ -25,17 +86,29 @@ export default function AgentPanel({ socket }) {
   const [curateResults, setCurateResults] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(null);
   const [modelsList, setModelsList] = useState([]);
-  const [repos, setRepos] = useState([]);
+
+  // Agent conversation logs — keyed by profile id. Each entry: { role, text, ts, agent_id }
+  // Persisted in component state (survives tab switches since App.jsx keeps all tabs mounted).
+  const [agentLogs, setAgentLogs] = useState({});  // { researcher: [{role, text, ts, agent_id}], ... }
+  const [agentStatus, setAgentStatus] = useState({});  // { researcher: 'running', ... }
+  const logEndRef = useRef(null);
+
+  // jcode-specific state (developer profile)
   const [useJcode, setUseJcode] = useState(() => {
     try { return localStorage.getItem('dev_use_jcode') === 'true'; } catch { return false; }
+  }); // false = auto (classifier decides); true = force jcode
+  const [jcodeRepo, setJcodeRepo] = useState(() => {
+    try { return localStorage.getItem('dev_jcode_repo') || '/media/sf_AI_Ecosystem/10_Projects/'; } catch { return '/media/sf_AI_Ecosystem/10_Projects/'; }
   });
-  const [selectedRepo, setSelectedRepo] = useState(() => {
-    try { return localStorage.getItem('dev_repo') || '/media/sf_AI_Ecosystem/10_Projects/'; } catch { return '/media/sf_AI_Ecosystem/10_Projects/'; }
+  const [jcodeToolProfile, setJcodeToolProfile] = useState(() => {
+    try { return localStorage.getItem('dev_jcode_tool_profile') || 'minimal'; } catch { return 'minimal'; }
   });
+  const [jcodeRepos, setJcodeRepos] = useState([]);
   const [jcodeRunId, setJcodeRunId] = useState(null);
-  const [jcodeStatus, setJcodeStatus] = useState(null);
+  const [jcodeStatus, setJcodeStatus] = useState('idle'); // idle running completed error cancelled
   const [jcodeOutput, setJcodeOutput] = useState('');
-  const [showJcodeOutput, setShowJcodeOutput] = useState(false);
+  const [jcodeHistory, setJcodeHistory] = useState([]);
+  const jcodePollRef = useRef(null);
 
   // Dreamer-specific state
   const [dreaming, setDreaming] = useState(false);
@@ -64,15 +137,59 @@ export default function AgentPanel({ socket }) {
     const onProgress = (data) => { setCurateProgress(data.percent || 0); setCurateMessage(data.message || ''); };
     const onComplete = (data) => { setCurating(false); setCurateProgress(100); setCurateMessage('Curadoria concluida!'); setCurateResults(data.results || []); };
     const onError = (data) => { setCurating(false); setCurateMessage(`Erro: ${data.message || 'Unknown'}`); };
+    // jcode stream listener
+    const onJcodeStream = (data) => {
+      if (!data || !data.chunk) return;
+      setJcodeOutput(prev => (prev + data.chunk).slice(-20000));
+    };
+    const onTaskDispatched = (data) => {
+      if (data.jcode_run_id) {
+        startJcodePolling(data.jcode_run_id);
+      }
+    };
     socket.on('wiki_curate_started', onStarted);
     socket.on('wiki_curate_progress', onProgress);
     socket.on('wiki_curate_complete', onComplete);
     socket.on('wiki_curate_error', onError);
+    socket.on('jcode_stream', onJcodeStream);
+    socket.on('task_dispatched', onTaskDispatched);
+
+    // ─── Live agent output streaming ───
+    const onAgentStream = (data) => {
+      if (!data || !data.agent_id || !data.profile) return;
+      const profile = data.profile;
+      setAgentStatus(prev => ({ ...prev, [profile]: data.status || 'running' }));
+      // Append stream chunk to the agent's log
+      setAgentLogs(prev => {
+        const logs = prev[profile] || [];
+        // If the last entry is a stream from the same agent_id, append to it
+        const last = logs[logs.length - 1];
+        if (last && last.role === 'agent' && last.agent_id === data.agent_id && !last.is_final) {
+          const updated = [...logs];
+          updated[updated.length - 1] = { ...last, text: data.output || '', ts: data.timestamp || new Date().toISOString() };
+          return { ...prev, [profile]: updated };
+        }
+        // Otherwise create a new entry
+        return { ...prev, [profile]: [...logs, { role: 'agent', text: data.output || '', ts: data.timestamp || new Date().toISOString(), agent_id: data.agent_id, is_final: !!data.is_final }] };
+      });
+    };
+    const onAgentCompleted = (data) => {
+      if (!data || !data.agent_id) return;
+      const profile = data.profile || data.agent_id.split('_')[0];
+      setAgentStatus(prev => ({ ...prev, [profile]: data.status || 'completed' }));
+    };
+    socket.on('agent_stream', onAgentStream);
+    socket.on('agent_completed', onAgentCompleted);
+
     return () => {
       socket.off('wiki_curate_started', onStarted);
       socket.off('wiki_curate_progress', onProgress);
       socket.off('wiki_curate_complete', onComplete);
       socket.off('wiki_curate_error', onError);
+      socket.off('jcode_stream', onJcodeStream);
+      socket.off('task_dispatched', onTaskDispatched);
+      socket.off('agent_stream', onAgentStream);
+      socket.off('agent_completed', onAgentCompleted);
     };
   }, [socket]);
 
@@ -81,46 +198,30 @@ export default function AgentPanel({ socket }) {
       .then(r => r.json())
       .then(d => setModelsList(d.models || []))
       .catch(() => {});
+  }, []);
+
+  // Fetch last Dreamer report on mount
+  useEffect(() => {
+    refreshLastReport();
+  }, []);
+
+  // Fetch jcode repos on mount
+  useEffect(() => {
     fetch(`${window.location.origin}/api/jcode/repos`)
       .then(r => r.json())
-      .then(d => setRepos(d.repos || []))
+      .then(d => setJcodeRepos(d.repos || []))
       .catch(() => {});
   }, []);
 
+  // Load jcode history on mount
   useEffect(() => {
-    if (!socket) return;
-    const onStream = (msg) => {
-      if (msg.run_id === jcodeRunId) {
-        setJcodeOutput(prev => prev + msg.chunk);
-      }
-    };
-    const onStatus = (msg) => {
-      if (msg.run_id === jcodeRunId) {
-        setJcodeStatus(msg.status);
-        if (msg.status === 'completed' || msg.status === 'error' || msg.status === 'cancelled') {
-          setJcodeRunId(null);
-        }
-      }
-    };
-    const onDispatched = (d) => {
-      if (d.jcode_run_id) {
-        setJcodeRunId(d.jcode_run_id);
-        setJcodeStatus('running');
-        setShowJcodeOutput(true);
-      }
-    };
-    socket.on('jcode_stream', onStream);
-    socket.on('jcode_status', onStatus);
-    socket.on('task_dispatched', onDispatched);
-    return () => {
-      socket.off('jcode_stream', onStream);
-      socket.off('jcode_status', onStatus);
-      socket.off('task_dispatched', onDispatched);
-    };
-  }, [socket, jcodeRunId]);
-
-  useEffect(() => {
-    refreshLastReport();
+    fetch(`${window.location.origin}/api/jcode/runs`)
+      .then(r => r.json())
+      .then(d => {
+        const runs = Array.isArray(d) ? d : [];
+        setJcodeHistory(runs.filter(r => r.agent_id && r.agent_id.startsWith('dev_')).slice(0, 20));
+      })
+      .catch(() => {});
   }, []);
 
   const refreshLastReport = () => {
@@ -145,76 +246,73 @@ export default function AgentPanel({ socket }) {
     const model = getSavedModel(id);
     const payload = { target_profile: id, task: txt };
     if (model) payload.model = model;
-    if (id === 'dev') {
-      payload.use_jcode = useJcode;
-      payload.repo_path = selectedRepo;
+    if (id === 'developer' && useJcode) {
+      payload.use_jcode = true;
+      payload.repo_path = jcodeRepo;
+      payload.tool_profile = jcodeToolProfile;
+      payload.timeout = 600;
+      setJcodeOutput('');
+      setJcodeStatus('running');
     }
     socket.emit('dispatch_task', payload);
     setDispatched(id);
+    // Add user task to the agent's conversation log
+    setAgentLogs(prev => {
+      const logs = prev[id] || [];
+      return { ...prev, [id]: [...logs, { role: 'user', text: txt, ts: new Date().toISOString() }] };
+    });
+    setAgentStatus(prev => ({ ...prev, [id]: 'running' }));
     setTasks(prev => ({ ...prev, [id]: '' }));
-    setShowJcodeOutput(true);
-    setJcodeOutput('');
-    setJcodeStatus('running');
     setTimeout(() => setDispatched(null), 3000);
   };
 
-  const handleJcodeToggle = (e) => {
-    const val = e.target.checked;
-    setUseJcode(val);
-    try { localStorage.setItem('dev_use_jcode', val ? 'true' : 'false'); } catch {}
+  const clearAgentLog = (id) => setAgentLogs(prev => ({ ...prev, [id]: [] }));
+
+  const toggleJcode = () => {
+    const next = !useJcode;
+    setUseJcode(next);
+    try { localStorage.setItem('dev_use_jcode', String(next)); } catch {}
   };
 
-  const handleRepoChange = (e) => {
+  const handleJcodeRepoChange = (e) => {
     const val = e.target.value;
-    setSelectedRepo(val);
-    try { localStorage.setItem('dev_repo', val); } catch {}
+    setJcodeRepo(val);
+    try { localStorage.setItem('dev_jcode_repo', val); } catch {}
   };
 
-  const handleKillJcode = () => {
-    if (!jcodeRunId || !socket) return;
-    socket.emit('kill_jcode_run', { run_id: jcodeRunId });
+  const handleJcodeToolChange = (e) => {
+    const val = e.target.value;
+    setJcodeToolProfile(val);
+    try { localStorage.setItem('dev_jcode_tool_profile', val); } catch {}
   };
 
-  const handleClearJcodeOutput = () => {
-    setJcodeOutput('');
-    setShowJcodeOutput(false);
-    setJcodeStatus(null);
+  const killJcodeRun = async () => {
+    if (!jcodeRunId) return;
+    await fetch(`${window.location.origin}/api/jcode/${jcodeRunId}/kill`, { method: 'POST' });
+    setJcodeStatus('cancelled');
+    if (jcodePollRef.current) clearInterval(jcodePollRef.current);
   };
 
-  useEffect(() => {
-    if (!socket) return;
-    const onStream = (msg) => {
-      if (msg.run_id === jcodeRunId) {
-        setJcodeOutput(prev => prev + msg.chunk);
-      }
-    };
-    const onStatus = (msg) => {
-      if (msg.run_id === jcodeRunId) {
-        setJcodeStatus(msg.status);
-        if (msg.status === 'completed' || msg.status === 'error' || msg.status === 'cancelled') {
-          setJcodeRunId(null);
+  const startJcodePolling = (runId) => {
+    setJcodeRunId(runId);
+    if (jcodePollRef.current) clearInterval(jcodePollRef.current);
+    jcodePollRef.current = setInterval(async () => {
+      try {
+        const r = await fetch(`${window.location.origin}/api/jcode/${runId}`);
+        if (!r.ok) return;
+        const d = await r.json();
+        setJcodeStatus(d.status || 'running');
+        if (d.status && d.status !== 'running' && d.status !== 'pending') {
+          clearInterval(jcodePollRef.current);
+          jcodePollRef.current = null;
         }
-      }
-    };
-    const onDispatched = (d) => {
-      if (d.jcode_run_id) {
-        setJcodeRunId(d.jcode_run_id);
-        setJcodeStatus('running');
-        setShowJcodeOutput(true);
-      }
-    };
-    socket.on('jcode_stream', onStream);
-    socket.on('jcode_status', onStatus);
-    socket.on('task_dispatched', onDispatched);
-    return () => {
-      socket.off('jcode_stream', onStream);
-      socket.off('jcode_status', onStatus);
-      socket.off('task_dispatched', onDispatched);
-    };
-  }, [socket, jcodeRunId]);
-  useEffect(() => {
-    refreshLastReport();
-  }, []);
+      } catch {}
+    }, 1500);
+  };
+
+  // ─── Dreamer-specific functions ───
+
+  const clearDreamError = () => setDreamError(null);
 
   const startDream = async () => {
     if (dreaming) return;
@@ -419,7 +517,7 @@ export default function AgentPanel({ socket }) {
     const ag = allAgents.find(a => a.id === focused);
     if (!ag) { setFocused(null); return null; }
     const isWiki = ag.id === 'wiki';
-    const isDreamer = ag.id === 'dream';
+    const isDreamer = ag.id === 'dreamer';
     const hasDreamError = isDreamer && dreamError;
 
     return (
@@ -497,6 +595,13 @@ export default function AgentPanel({ socket }) {
               />
               <p className="text-[8px] text-[var(--text-dim)]">Estas notas sao enviadas como contexto ao carregar em Sonhar ou Corrigir.</p>
               <ProgressBar percent={dreamProgress} message={dreamMessage} error={!!hasDreamError} colorStart="#c084fc" colorEnd="#a78bfa" />
+              <ConversationLog
+                profileId={ag.id}
+                logs={agentLogs[ag.id] || []}
+                status={agentStatus[ag.id]}
+                onClear={() => clearAgentLog(ag.id)}
+                logEndRef={logEndRef}
+              />
             </div>
           )}
 
@@ -508,47 +613,80 @@ export default function AgentPanel({ socket }) {
               </button>
               <p className="text-[9px] text-[var(--text-dim)] mt-1">Verifica links, adiciona ao index, arquiva orfaos, e atualiza datas.</p>
               <ProgressBar percent={curateProgress} message={curateMessage} colorStart="var(--amber-warn)" colorEnd="var(--matrix-green)" />
+              <ConversationLog
+                profileId={ag.id}
+                logs={agentLogs[ag.id] || []}
+                status={agentStatus[ag.id]}
+                onClear={() => clearAgentLog(ag.id)}
+                logEndRef={logEndRef}
+              />
             </div>
           )}
 
           {/* ─── Standard agents: textarea + dispatch ─── */}
           {!isDreamer && !isWiki && (
             <>
-              {ag.id === 'dev' && (
-                <div className="mb-3 p-3 rounded-lg border" style={{ borderColor: 'var(--border-subtle)', background: 'var(--bg-primary)' }}>
-                  <div className="flex items-center gap-2 mb-2">
-                    <span className="text-[11px] font-mono" style={{ color: 'var(--cyber-blue)' }}>Modo: jcode</span>
-                    <span className="text-[9px]" style={{ color: 'var(--text-dim)' }}>(coding agent)</span>
+              {/* ─── Conversation Log ─── */}
+              <ConversationLog
+                profileId={ag.id}
+                logs={agentLogs[ag.id] || []}
+                status={agentStatus[ag.id]}
+                onClear={() => clearAgentLog(ag.id)}
+                logEndRef={logEndRef}
+              />
+              {ag.id === 'developer' && (
+                <div className="mb-3 p-3 rounded-lg border text-[10px] font-mono space-y-2" style={{ borderColor: 'var(--border-subtle)', background: 'var(--bg-primary)' }}>
+                  <div className="flex items-center justify-between">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input type="checkbox" checked={useJcode} onChange={toggleJcode} className="accent-[var(--cyber-blue)]" />
+                      <span style={{ color: useJcode ? 'var(--cyber-blue)' : 'var(--text-secondary)' }}>{useJcode ? '⚡ jcode forçado' : '🤖 Auto (classificador)'}</span>
+                    </label>
+                    <span className="text-[8px]" style={{ color: 'var(--text-dim)' }}>{useJcode ? 'Força jcode para todas as tarefas' : 'jcode só se classificador detetar código'}</span>
                   </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-[10px] font-mono" style={{ color: 'var(--text-secondary)' }}>Repo:</span>
-                    <select value={selectedRepo} onChange={handleRepoChange} className="agent-input text-[10px] flex-1" style={{ minWidth: 0 }}>
-                      {repos.map(r => (
-                        <option key={r.path} value={r.path}>{r.path}</option>
-                      ))}
-                    </select>
+                  <div className="text-[8px]" style={{ color: 'var(--text-dim)' }}>
+                    Dica: escreve <code>no_jcode</code> na tarefa para forçar Hermes.
                   </div>
+                  {useJcode && (
+                    <>
+                      <div className="flex gap-2">
+                        <select value={jcodeRepo} onChange={handleJcodeRepoChange} className="flex-1 bg-[var(--bg-secondary)] border rounded px-2 py-1 text-[10px]" style={{ borderColor: 'var(--border-subtle)', color: 'var(--text-primary)' }}>
+                          <option value="/media/sf_AI_Ecosystem/10_Projects/">/media/sf_AI_Ecosystem/10_Projects/</option>
+                          {jcodeRepos.map(r => (
+                            <option key={r.path} value={r.path}>{r.path}</option>
+                          ))}
+                        </select>
+                        <select value={jcodeToolProfile} onChange={handleJcodeToolChange} className="bg-[var(--bg-secondary)] border rounded px-2 py-1 text-[10px]" style={{ borderColor: 'var(--border-subtle)', color: 'var(--text-primary)' }}>
+                          <option value="none">none (leitura)</option>
+                          <option value="minimal">minimal</option>
+                          <option value="full">full</option>
+                        </select>
+                      </div>
+                      <div className="text-[8px]" style={{ color: 'var(--text-dim)' }}>
+                        Repo: {jcodeRepo} · Tool profile: {jcodeToolProfile}
+                      </div>
+                    </>
+                  )}
                 </div>
               )}
               <textarea className="agent-input w-full text-[12px] mb-3" rows={8} placeholder={`Task for ${ag.name}...`} value={tasks[ag.id] || ''} onChange={e => updateTask(ag.id, e.target.value)} onKeyDown={e => { if (e.key==='Enter' && e.ctrlKey) { e.preventDefault(); dispatchTask(ag.id); } }} />
               <div className="flex gap-2">
-                <button onClick={() => dispatchTask(ag.id)} disabled={!(tasks[ag.id] || '').trim()} className="btn-glow flex-1 text-[11px] py-2 px-4 rounded-lg font-mono font-bold border" style={{ background: !(tasks[ag.id] || '').trim() ? 'var(--bg-secondary)' : 'var(--bg-card)', borderColor: !(tasks[ag.id] || '').trim() ? 'var(--border-subtle)' : 'var(--matrix-green)', color: !(tasks[ag.id] || '').trim() ? 'var(--text-muted)' : 'var(--matrix-green)', cursor: !(tasks[ag.id] || '').trim() ? 'not-allowed' : 'pointer', opacity: !(tasks[ag.id] || '').trim() ? 0.5 : 1 }}>
-                  {dispatched===ag.id ? '✓ Dispatched!' : 'Dispatch'}
+                <button onClick={() => dispatchTask(ag.id)} disabled={!(tasks[ag.id] || '').trim() || (ag.id === 'developer' && jcodeStatus === 'running')} className="btn-glow flex-1 text-[11px] py-2 px-4 rounded-lg font-mono font-bold border" style={{ background: !(tasks[ag.id] || '').trim() ? 'var(--bg-secondary)' : 'var(--bg-card)', borderColor: !(tasks[ag.id] || '').trim() ? 'var(--border-subtle)' : 'var(--matrix-green)', color: !(tasks[ag.id] || '').trim() ? 'var(--text-muted)' : 'var(--matrix-green)', cursor: !(tasks[ag.id] || '').trim() ? 'not-allowed' : 'pointer', opacity: !(tasks[ag.id] || '').trim() ? 0.5 : 1 }}>
+                  {jcodeStatus === 'running' ? '⏳ jcode...' : dispatched===ag.id ? '✓ Dispatched!' : 'Dispatch'}
                 </button>
+                {ag.id === 'developer' && useJcode && jcodeStatus === 'running' && (
+                  <button onClick={killJcodeRun} className="btn-glow px-4 py-2 rounded-lg text-xs font-mono border" style={{ background: 'rgba(255,50,50,0.12)', borderColor: 'var(--alert-red)', color: 'var(--alert-red)' }}>Parar</button>
+                )}
                 <button onClick={() => setFocused(null)} className="btn-glow px-4 py-2 rounded-lg text-xs font-mono border" style={{ background:'var(--bg-hover)', borderColor:'var(--border-subtle)', color: 'var(--text-secondary)' }}>←</button>
               </div>
-              {ag.id === 'dev' && jcodeRunId && (
-                <button onClick={handleKillJcode} disabled={!jcodeRunId} className="mt-2 w-full py-2 rounded-lg text-[11px] font-mono font-bold border" style={{ background: 'rgba(218,54,51,0.15)', borderColor: 'var(--alert-red)', color: 'var(--alert-red)' }}>
-                  Parar jcode
-                </button>
-              )}
-              {ag.id === 'dev' && showJcodeOutput && (
+              {ag.id === 'developer' && useJcode && jcodeOutput && (
                 <div className="mt-3">
                   <div className="flex items-center justify-between mb-1">
-                    <span className="text-[10px] font-mono" style={{ color: 'var(--text-secondary)' }}>Output jcode {jcodeStatus ? `(${jcodeStatus})` : ''}</span>
-                    <button onClick={handleClearJcodeOutput} className="text-[9px]" style={{ color: 'var(--text-dim)' }}>Limpar</button>
+                    <span className="text-[10px] font-mono" style={{ color: 'var(--cyber-blue)' }}>jcode output · {jcodeStatus}</span>
+                    {jcodeStatus !== 'running' && jcodeStatus !== 'pending' && (
+                      <span className="text-[8px] font-mono" style={{ color: jcodeStatus === 'completed' ? 'var(--matrix-green)' : 'var(--alert-red)' }}>{jcodeStatus}</span>
+                    )}
                   </div>
-                  <pre className="bg-black rounded-lg p-3 max-h-64 overflow-auto text-[10px] font-mono text-green-400 whitespace-pre-wrap">{jcodeOutput || '(aguarda output...)'}</pre>
+                  <pre className="w-full p-2 rounded-lg border text-[10px] font-mono overflow-auto" style={{ maxHeight: '320px', borderColor: 'var(--border-subtle)', background: 'var(--bg-primary)', color: 'var(--text-secondary)', whiteSpace: 'pre-wrap' }}>{jcodeOutput}</pre>
                 </div>
               )}
               <span className="text-[9px] text-[var(--text-dim)] mt-2 block">Ctrl+Enter para enviar</span>
@@ -597,7 +735,7 @@ export default function AgentPanel({ socket }) {
                 {curating ? '⏳ ...' : '🔍 Curar Wiki'}
               </button>
             )}
-            {ag.id === 'dream' && (
+            {ag.id === 'dreamer' && (
               <button onClick={e => { e.stopPropagation(); startDream(); }} disabled={dreaming} className="w-full mb-2 py-1.5 rounded-lg text-[9px] font-mono font-bold border transition-all duration-300" style={{ background: dreaming ? 'var(--bg-secondary)' : 'rgba(192,132,252,0.1)', borderColor: dreaming ? 'var(--border-subtle)' : dreamError ? 'var(--alert-red)' : '#c084fc', color: dreaming ? 'var(--text-muted)' : dreamError ? 'var(--alert-red)' : '#c084fc', cursor: dreaming ? 'not-allowed' : 'pointer', opacity: dreaming ? 0.5 : 1 }}>
                 {dreaming ? '⏳ ...' : dreamError ? '⚠️ Sonhar' : '🌙 Sonhar'}
               </button>
