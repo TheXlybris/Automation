@@ -2,56 +2,79 @@ import { useState, useRef, useEffect } from 'react';
 
 const API_BASE = window.location.origin;
 
-function VideoGenerator({ onVideoToPool, socket }) {
-  const [imagePath, setImagePath] = useState('');
+const STYLES = {
+  fantasy: {
+    label: 'Fantasy',
+    negative: 'static, still, motionless, blurry details, worst quality, low quality, JPEG artifacts, deformed, disfigured, morphological aberrations, messy background, overall gray, overexposed, realistic, photographic, live-action, real world, text, watermark, subtitle',
+  },
+  realistic: {
+    label: 'Realista',
+    negative: 'static, still, motionless, blurry details, worst quality, low quality, JPEG artifacts, deformed, disfigured, morphological aberrations, messy background, overexposed, cartoon, anime, illustration, painting, 3d render, text, watermark, subtitle',
+  },
+};
+
+const DURATIONS = [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 70, 80, 90, 100, 120, 140, 160, 180, 200];
+
+export default function VideoGenerator({ onVideoToPool }) {
+  const [style, setStyle] = useState('fantasy');
+  const [imageFilename, setImageFilename] = useState('');
   const [imagePreview, setImagePreview] = useState(null);
-  const [imagePrompt, setImagePrompt] = useState('');
-  const [videoPrompt, setVideoPrompt] = useState('');
-  const [translate, setTranslate] = useState(true);
-  const [strength, setStrength] = useState(0.15);
-  const [length, setLength] = useState(153);
+  const [scene, setScene] = useState('');
+  const [duration, setDuration] = useState(40);
+  const [prompts, setPrompts] = useState([]);
+  const [negative, setNegative] = useState(STYLES.fantasy.negative);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [fps, setFps] = useState(16);
+  const [upscale, setUpscale] = useState(1);
+  const [steps, setSteps] = useState(8);
+  const [cfg, setCfg] = useState(1.5);
   const [seed, setSeed] = useState(-1);
-  const [steps, setSteps] = useState(50);
-  const [cfg, setCfg] = useState(3.0);
-  const [status, setStatus] = useState('idle'); // idle | uploading | submitted | running | completed | fetching | done | error
-  const [jobId, setJobId] = useState(null);
-  const [progressMsg, setProgressMsg] = useState('');
+  const [generating, setGenerating] = useState(false);
+  const [storyboardLoading, setStoryboardLoading] = useState(false);
+  const [postProcessing, setPostProcessing] = useState(false);
+  const [statusMsg, setStatusMsg] = useState('');
+  const [statusType, setStatusType] = useState('');
   const [resultVideo, setResultVideo] = useState(null);
+  const [ppVideoFilename, setPpVideoFilename] = useState('');
+  const [resultUrl, setResultUrl] = useState('');
   const pollRef = useRef(null);
-  const dropRef = useRef(null);
 
-  const clearJob = () => {
+  const [progress, setProgress] = useState(null); // {node, value, max, step}
+  const [clientId, setClientId] = useState('');
+  const wsRef = useRef(null);
+  const COMFYUI_WS = 'ws://192.168.0.187:8188/ws';
+
+  useEffect(() => () => {
     if (pollRef.current) clearInterval(pollRef.current);
-    pollRef.current = null;
-    setJobId(null);
-    setStatus('idle');
-    setProgressMsg('');
-    setResultVideo(null);
-    setImagePreview(null);
-    setImagePath('');
-  };
-
-  useEffect(() => {
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+    if (wsRef.current) wsRef.current.close();
   }, []);
 
+  const stopPolling = () => {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+  };
+  const stopWS = () => {
+    if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
+  };
+
+  // ── Style ──
+  const handleStyleChange = (s) => {
+    setStyle(s);
+    setNegative(STYLES[s].negative);
+  };
+
+  // ── Image upload ──
   const handleDrop = async (e) => {
     e.preventDefault();
-    const files = e.dataTransfer.files;
-    if (!files || !files.length) return;
-    await uploadImage(files[0]);
+    const file = e.dataTransfer.files[0];
+    if (file) await uploadImage(file);
   };
 
   const handleFileInput = async (e) => {
     const file = e.target.files[0];
-    if (!file) return;
-    await uploadImage(file);
+    if (file) await uploadImage(file);
   };
 
   const uploadImage = async (file) => {
-    setStatus('uploading');
-    setProgressMsg('Upload da imagem...');
-    // Preview local antes do upload
     const reader = new FileReader();
     reader.onloadend = () => setImagePreview(reader.result);
     reader.readAsDataURL(file);
@@ -61,267 +84,712 @@ function VideoGenerator({ onVideoToPool, socket }) {
       const res = await fetch(`${API_BASE}/api/media/upload`, { method: 'POST', body: form });
       const data = await res.json();
       if (!data.success) throw new Error(data.error || 'Upload falhou');
-      setImagePath(data.path);
-      setStatus('idle');
-      setProgressMsg('Imagem pronta. Preenche o prompt e clica Gerar.');
-      // Metadata extraction desativado — endpoint nao implementado
-      // extractMetadata(data.path);
+      setImageFilename(data.filename);
+      setStatusMsg('Imagem carregada. Gera o script e depois o vídeo.');
+      setStatusType('info');
     } catch (err) {
-      setStatus('error');
-      setProgressMsg(`Erro upload: ${err.message}`);
+      setStatusMsg(`Erro upload: ${err.message}`);
+      setStatusType('error');
     }
   };
 
-  const extractMetadata = async (path) => {
+  // ── Storyboard ──
+  const generateStoryboard = async () => {
+    if (!scene.trim()) return;
+    setStoryboardLoading(true);
+    setStatusMsg('A gerar script...');
+    setStatusType('info');
+    setPrompts([]);
     try {
-      const res = await fetch(`${API_BASE}/api/comfy/image/metadata`, {
+      const res = await fetch(`${API_BASE}/api/video/storyboard`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image_path: path })
+        body: JSON.stringify({ scene, duration, style }),
       });
-      if (!res.ok) return;
       const data = await res.json();
-      if (data.prompt) {
-        setImagePrompt(data.prompt);
-        if (translate) {
-          // Frontend não traduz — envia para o backend traduzir no generate
-        }
-      }
-    } catch (e) { /* ignore */ }
+      if (data.error) throw new Error(data.error);
+      setPrompts(data.positive || []);
+      if (data.negative) setNegative(data.negative);
+      setStatusMsg(`${data.positive?.length || 0} prompts gerados.`);
+      setStatusType('success');
+    } catch (err) {
+      setStatusMsg(`Erro: ${err.message}`);
+      setStatusType('error');
+    }
+    setStoryboardLoading(false);
   };
 
+  const updatePrompt = (idx, val) => {
+    setPrompts(prompts.map((p, i) => i === idx ? val : p));
+  };
+
+  // ── Generate ──
   const generateVideo = async () => {
-    if (!imagePath) {
-      setProgressMsg('Seleciona uma imagem primeiro.');
+    if (!imageFilename || prompts.length === 0) {
+      setStatusMsg('Carrega imagem e gera o script primeiro.');
+      setStatusType('error');
       return;
     }
-    clearJob();
-    setStatus('submitted');
-    setProgressMsg('A submeter job para ComfyUI...');
+    setGenerating(true);
+    setResultVideo(null);
+    setResultUrl('');
+    setStatusMsg('A submeter ao ComfyUI...');
+    setStatusType('info');
+    stopPolling();
     try {
-      const res = await fetch(`${API_BASE}/api/comfy/video/generate`, {
+      const res = await fetch(`${API_BASE}/api/video/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          image_path: imagePath,
-          image_prompt: imagePrompt,
-          video_prompt: videoPrompt || undefined,
-          negative: "low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, artifacts, fused fingers, bad anatomy, weird hand, ugly",
-          strength, length, seed, steps, cfg, translate
-        })
+          image_filename: imageFilename, prompts, negative, style,
+          steps, cfg, seed,
+        }),
       });
       const data = await res.json();
-      if (data.status === 'error') throw new Error(data.message);
-      setJobId(data.prompt_id);
-      setStatus('running');
-      setProgressMsg(`Job ${data.prompt_id} em execução...`);
+      if (data.error) throw new Error(data.error);
+      if (data.client_id) {
+        setClientId(data.client_id);
+        startWS(data.client_id, data.prompt_id);
+      }
+      setStatusMsg('Na fila do ComfyUI...');
       startPolling(data.prompt_id);
     } catch (err) {
-      setStatus('error');
-      setProgressMsg(`Erro: ${err.message}`);
+      setStatusMsg(`Erro: ${err.message}`);
+      setStatusType('error');
+      setGenerating(false);
     }
+  };
+
+  // ── WebSocket progress ──
+  const [wsNodeCount, setWsNodeCount] = useState(0);
+  const [wsTotalNodes, setWsTotalNodes] = useState(0);
+  const startWS = (cid, pid) => {
+    stopWS();
+    setWsNodeCount(0);
+    setWsTotalNodes(0);
+    setProgress(null);
+    try {
+      const ws = new WebSocket(`${COMFYUI_WS}?clientId=${cid}`);
+      wsRef.current = ws;
+      let executedNodes = 0;
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          // ComfyUI v0.23: executing/progress may not carry prompt_id
+          // Only filter when prompt_id is present and doesn't match
+          if (msg.data && msg.data.prompt_id && msg.data.prompt_id !== pid) return;
+
+          if (msg.type === 'execution_start') {
+            setStatusMsg('ComfyUI iniciou execução...');
+            setStatusType('info');
+          } else if (msg.type === 'executing') {
+            // {node: id, display_node: name} — node null = finished
+            if (msg.data.node === null || msg.data.node === undefined) return;
+            executedNodes++;
+            setWsNodeCount(executedNodes);
+            const nodeName = msg.data.display_node || msg.data.node || '';
+            setStatusMsg(`A executar node ${executedNodes}: ${nodeName}`);
+          } else if (msg.type === 'progress') {
+            // ComfyUI v0.23: {value, max, step} — actual sampling progress
+            setProgress({
+              value: msg.data.value || 0,
+              max: msg.data.max || 0,
+              step: msg.data.step || 0,
+            });
+            setStatusMsg(`A amostrar: ${msg.data.value}/${msg.data.max} (step ${msg.data.step || '?'})`);
+          } else if (msg.type === 'executed') {
+            setProgress(null);
+          } else if (msg.type === 'execution_error' || msg.type === 'execution_interrupted') {
+            setStatusMsg('Erro no ComfyUI');
+            setStatusType('error');
+          }
+        } catch (e) {}
+      };
+      ws.onerror = () => {};
+      ws.onopen = () => {
+        setStatusMsg('WebSocket conectado — à espera do ComfyUI...');
+      };
+    } catch (e) {}
   };
 
   const startPolling = (pid) => {
-    if (pollRef.current) clearInterval(pollRef.current);
+    stopPolling();
     pollRef.current = setInterval(async () => {
       try {
-        const res = await fetch(`${API_BASE}/api/comfy/video/status/${pid}`);
+        const res = await fetch(`${API_BASE}/api/video/status/${pid}`);
         const data = await res.json();
-        if (data.status === 'completed') {
-          clearInterval(pollRef.current);
-          pollRef.current = null;
-          setStatus('fetching');
-          setProgressMsg('Vídeo pronto. A copiar para o Media Pool...');
-          const v = data.videos?.[0];
-          if (v) {
-            await fetchToPool(v.filename, v.subfolder);
-          } else {
-            setStatus('error');
-            setProgressMsg('Completado mas nenhum vídeo encontrado.');
+        if (data.status === 'done') {
+          stopPolling();
+          stopWS();
+          setProgress(null);
+          const vids = data.videos || [];
+          if (vids.length === 0) {
+            setGenerating(false);
+            setStatusMsg('Concluído mas sem vídeos.');
+            setStatusType('error');
+            return;
           }
+          // Multiple chunks → fetch concatenates them; single → just fetch
+          if (vids.length > 1) {
+            setStatusMsg(`${vids.length} chunks gerados. A concatenar...`);
+          } else {
+            setStatusMsg('Vídeo pronto. A copiar...');
+          }
+          await fetchVideo(vids);
         } else if (data.status === 'error') {
-          clearInterval(pollRef.current);
-          pollRef.current = null;
-          setStatus('error');
-          setProgressMsg(`Erro ComfyUI: ${data.message || 'unknown'}`);
+          stopPolling();
+          setGenerating(false);
+          setStatusMsg(`Erro ComfyUI: ${data.error || 'desconhecido'}`);
+          setStatusType('error');
+        } else if (data.status === 'running') {
+          setStatusMsg('A gerar vídeo...');
         } else {
-          setProgressMsg(`Em execução... (${data.status})`);
+          setStatusMsg(`Na fila... (${data.status})`);
         }
-      } catch (err) {
-        // keep polling
-      }
+      } catch (e) { /* keep polling */ }
     }, 3000);
   };
 
-  const fetchToPool = async (filename, subfolder) => {
+  const fetchVideo = async (vids) => {
     try {
-      const res = await fetch(`${API_BASE}/api/comfy/video/fetch`, {
+      const res = await fetch(`${API_BASE}/api/video/fetch`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filename, subfolder })
+        body: JSON.stringify({ videos: vids }),
       });
       const data = await res.json();
-      if (data.success) {
-        setStatus('done');
-        setProgressMsg(`Vídeo no Media Pool: ${data.filename}`);
-        setResultVideo(data.filename);
-        if (onVideoToPool) onVideoToPool(data.filename);
-      } else {
-        throw new Error(data.error || 'Fetch falhou');
-      }
+      if (data.error) throw new Error(data.error);
+      setResultVideo(data.filename);
+      setResultUrl(data.url);
+      setGenerating(false);
+      setStatusMsg('Vídeo pronto!');
+      setStatusType('success');
     } catch (err) {
-      setStatus('error');
-      setProgressMsg(`Erro fetch: ${err.message}`);
+      setGenerating(false);
+      setStatusMsg(`Erro: ${err.message}`);
+      setStatusType('error');
     }
   };
 
-  const isRunning = status === 'running' || status === 'submitted' || status === 'fetching';
+  const runPostprocess = async () => {
+    const targetVideo = ppVideoFilename || resultVideo;
+    if (!targetVideo) {
+      setStatusMsg('Fornece um vídeo para pós-processar.');
+      setStatusType('error');
+      return;
+    }
+    setPostProcessing(true);
+    setProgress(null);
+    setStatusMsg('A submeter pós-processamento...');
+    setStatusType('info');
+    stopPolling();
+    try {
+      const res = await fetch(`${API_BASE}/api/video/postprocess`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: targetVideo, fps, upscale }),
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      if (data.client_id) {
+        setClientId(data.client_id);
+        startWS(data.client_id, data.prompt_id);
+      }
+      setStatusMsg('Pós-processamento na fila do ComfyUI...');
+      // Poll for PP completion
+      pollRef.current = setInterval(async () => {
+        try {
+          const sRes = await fetch(`${API_BASE}/api/video/status/${data.prompt_id}`);
+          const sData = await sRes.json();
+          if (sData.status === 'done') {
+            stopPolling();
+            stopWS();
+            setProgress(null);
+            const vids = sData.videos || [];
+            if (vids.length > 0) {
+              const fRes = await fetch(`${API_BASE}/api/video/fetch`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ videos: vids, upscale }),
+              });
+              const fData = await fRes.json();
+              if (fData.success) {
+                setResultVideo(fData.filename);
+                setResultUrl(fData.url);
+                setStatusMsg('Vídeo melhorado!');
+                setStatusType('success');
+              }
+            } else {
+              setStatusMsg('Pós-proc concluído mas sem vídeo.');
+              setStatusType('error');
+            }
+            setPostProcessing(false);
+          } else if (sData.status === 'error') {
+            stopPolling();
+            stopWS();
+            setPostProcessing(false);
+            setStatusMsg('Erro no pós-processamento');
+            setStatusType('error');
+          } else {
+            setStatusMsg(`Pós-processamento... (${sData.status})`);
+          }
+        } catch (e) {}
+      }, 3000);
+    } catch (err) {
+      setPostProcessing(false);
+      setStatusMsg(`Erro pós-proc: ${err.message}`);
+      setStatusType('error');
+    }
+  };
+
+  // ── Video upload for postprocess ──
+  const handlePpVideoUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const form = new FormData();
+    form.append('file', file);
+    try {
+      const res = await fetch(`${API_BASE}/api/media/upload`, { method: 'POST', body: form });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || 'Upload falhou');
+      setPpVideoFilename(data.filename);
+      setStatusMsg(`Vídeo carregado: ${data.filename}`);
+      setStatusType('info');
+    } catch (err) {
+      setStatusMsg(`Erro upload vídeo: ${err.message}`);
+      setStatusType('error');
+    }
+  };
+
+  // ── Media Pool ──
+  const sendToPool = () => {
+    if (resultVideo && onVideoToPool) onVideoToPool(resultVideo);
+  };
+
+  // ── Extend ──
+  const extendVideo = async () => {
+    if (!resultVideo) return;
+    setStatusMsg('A criar WF de extensão...');
+    setStatusType('info');
+    try {
+      const res = await fetch(`${API_BASE}/api/video/extend`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ video_filename: resultVideo, prompts, negative }),
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      if (data.prompt_id) {
+        // Auto-submitted to ComfyUI
+        setGenerating(true);
+        setResultVideo(null);
+        setResultUrl('');
+        setStatusMsg('Extensão submetida ao ComfyUI...');
+        startPolling(data.prompt_id);
+      } else {
+        setStatusMsg(`WF de extensão criado: ${data.wf_path || 'ok'}`);
+        setStatusType('success');
+      }
+    } catch (err) {
+      setStatusMsg(`Erro: ${err.message}`);
+      setStatusType('error');
+    }
+  };
+
+  // ── Render ──
+  const labelCls = 'text-[10px] text-[var(--text-dim)] block mb-1.5 font-mono';
+  const inputCls = 'input-glow w-full text-[12px]';
+  const chipCls = (active) => ({
+    padding: '4px 14px',
+    borderRadius: '6px',
+    fontSize: '11px',
+    fontFamily: 'monospace',
+    cursor: 'pointer',
+    transition: 'all 0.3s',
+    background: active ? 'var(--bg-card)' : 'transparent',
+    border: `1px solid ${active ? 'var(--cyber-blue)' : 'var(--border-subtle)'}`,
+    color: active ? 'var(--cyber-blue)' : 'var(--text-muted)',
+    boxShadow: active ? '0 0 8px rgba(0,200,255,0.15)' : 'none',
+  });
+
+  const isBusy = generating || storyboardLoading || postProcessing;
 
   return (
     <div className="space-y-4">
-      {/* Drop zone */}
+      {/* Style selector */}
+      <div className="flex items-center gap-3">
+        <span className={labelCls} style={{ marginBottom: 0 }}>Estilo</span>
+        {Object.entries(STYLES).map(([key, val]) => (
+          <button
+            key={key}
+            onClick={() => handleStyleChange(key)}
+            disabled={isBusy}
+            style={chipCls(style === key)}
+          >
+            {val.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Image upload */}
       <div
-        ref={dropRef}
         onDragOver={(e) => e.preventDefault()}
         onDrop={handleDrop}
-        className="border-2 border-dashed rounded-lg p-6 text-center cursor-pointer"
+        className="border-2 border-dashed rounded-lg p-5 text-center cursor-pointer transition-colors hover:border-[var(--cyber-blue)]"
         style={{ borderColor: 'var(--border-subtle)', background: 'var(--bg-card)' }}
         onClick={() => document.getElementById('vg-file-input').click()}
       >
-        <div className="text-2xl mb-2">🖼️</div>
-        <p className="text-xs font-mono" style={{ color: 'var(--text-muted)' }}>
-          Arrasta imagem PNG aqui ou clica para selecionar
-        </p>
+        {imagePreview ? (
+          <div className="rounded-lg overflow-hidden border" style={{ borderColor: 'var(--border-subtle)' }}>
+            <img src={imagePreview} alt="Preview" className="w-full object-contain" style={{ maxHeight: 180 }} />
+          </div>
+        ) : (
+          <>
+            <div className="text-2xl mb-1">🖼️</div>
+            <p className="text-[11px] font-mono" style={{ color: 'var(--text-muted)' }}>
+              Arrasta imagem PNG aqui ou clica para selecionar
+            </p>
+          </>
+        )}
         <input id="vg-file-input" type="file" accept="image/png,image/jpeg,image/webp" className="hidden" onChange={handleFileInput} />
       </div>
-
-      {imagePreview && (
-        <div className="rounded-lg overflow-hidden border" style={{ borderColor: 'var(--border-subtle)' }}>
-          <img src={imagePreview} alt="Preview" className="w-full object-contain" style={{ maxHeight: 200 }} />
-        </div>
-      )}
-
-      {imagePath && (
+      {imageFilename && (
         <div className="text-[10px] font-mono" style={{ color: 'var(--text-muted)' }}>
-          Imagem: {imagePath.split(/[\\/]/).pop()}
+          📎 {imageFilename}
         </div>
       )}
 
-      {/* Prompts */}
-      <div>
-        <label className="block text-[10px] font-mono uppercase mb-1" style={{ color: 'var(--text-secondary)' }}>Prompt da Imagem</label>
-        <textarea
-          className="w-full rounded-lg p-2 text-xs font-mono border"
-          style={{ background: 'var(--bg-primary)', borderColor: 'var(--border-subtle)', color: 'var(--text-primary)', minHeight: 60 }}
-          value={imagePrompt}
-          onChange={(e) => setImagePrompt(e.target.value)}
-          placeholder="Prompt original da imagem (auto-extrai se PNG ComfyUI)"
-        />
-      </div>
+      {/* Storyboard */}
+      <div className="rounded-lg border p-4" style={{ borderColor: 'var(--border-subtle)', background: 'var(--bg-card)' }}>
+        <div className="text-[11px] font-mono font-bold mb-3" style={{ color: 'var(--cyber-blue)' }}>
+          📝 STORYBOARD
+        </div>
 
-      <div className="flex items-center gap-2">
-        <input type="checkbox" id="vg-translate" checked={translate} onChange={(e) => setTranslate(e.target.checked)} />
-        <label htmlFor="vg-translate" className="text-[10px] font-mono" style={{ color: 'var(--text-secondary)' }}>
-          Traduzir prompt para movimento de vídeo
-        </label>
-      </div>
-
-      {!translate && (
-        <div>
-          <label className="block text-[10px] font-mono uppercase mb-1" style={{ color: 'var(--text-secondary)' }}>Prompt do Vídeo (manual)</label>
+        <div className="mb-3">
+          <label className={labelCls}>Descrição da cena (Português)</label>
           <textarea
-            className="w-full rounded-lg p-2 text-xs font-mono border"
-            style={{ background: 'var(--bg-primary)', borderColor: 'var(--border-subtle)', color: 'var(--text-primary)', minHeight: 60 }}
-            value={videoPrompt}
-            onChange={(e) => setVideoPrompt(e.target.value)}
-            placeholder="Prompt específico para vídeo (ignora tradução)"
+            className={inputCls}
+            rows={3}
+            placeholder="Ex: Um rio no meio de um vale a fluir, rodeado de arvores, com montanhas ao fundo"
+            value={scene}
+            onChange={(e) => setScene(e.target.value)}
+            disabled={isBusy}
           />
         </div>
-      )}
 
-      {/* Parameters */}
-      <div className="grid grid-cols-2 gap-3">
-        <div>
-          <label className="block text-[10px] font-mono uppercase mb-1" style={{ color: 'var(--text-secondary)' }}>Strength</label>
-          <input type="range" min="0" max="1" step="0.01" value={strength} onChange={(e) => setStrength(parseFloat(e.target.value))} className="w-full" />
-          <div className="text-[10px] font-mono text-right" style={{ color: 'var(--matrix-green)' }}>{strength.toFixed(2)}</div>
-        </div>
-        <div>
-          <label className="block text-[10px] font-mono uppercase mb-1" style={{ color: 'var(--text-secondary)' }}>Frames</label>
-          <input type="range" min="25" max="257" step="1" value={length} onChange={(e) => setLength(parseInt(e.target.value))} className="w-full" />
-          <div className="text-[10px] font-mono text-right" style={{ color: 'var(--matrix-green)' }}>{length}</div>
-        </div>
-        <div>
-          <label className="block text-[10px] font-mono uppercase mb-1" style={{ color: 'var(--text-secondary)' }}>Steps</label>
-          <input type="range" min="20" max="100" step="1" value={steps} onChange={(e) => setSteps(parseInt(e.target.value))} className="w-full" />
-          <div className="text-[10px] font-mono text-right" style={{ color: 'var(--matrix-green)' }}>{steps}</div>
-        </div>
-        <div>
-          <label className="block text-[10px] font-mono uppercase mb-1" style={{ color: 'var(--text-secondary)' }}>CFG</label>
-          <input type="range" min="1" max="10" step="0.1" value={cfg} onChange={(e) => setCfg(parseFloat(e.target.value))} className="w-full" />
-          <div className="text-[10px] font-mono text-right" style={{ color: 'var(--matrix-green)' }}>{cfg.toFixed(1)}</div>
-        </div>
-        <div>
-          <label className="block text-[10px] font-mono uppercase mb-1" style={{ color: 'var(--text-secondary)' }}>Seed</label>
-          <input
-            type="number" value={seed} onChange={(e) => setSeed(parseInt(e.target.value))}
-            className="w-full rounded p-1 text-xs font-mono border"
-            style={{ background: 'var(--bg-primary)', borderColor: 'var(--border-subtle)', color: 'var(--text-primary)' }}
-          />
-          <div className="text-[9px] font-mono" style={{ color: 'var(--text-muted)' }}>-1 = aleatório</div>
-        </div>
-      </div>
-
-      {/* Actions */}
-      <div className="flex items-center gap-3">
-        <button
-          onClick={generateVideo}
-          disabled={isRunning || !imagePath}
-          className="px-4 py-2 rounded-lg text-xs font-mono font-bold tracking-wider border transition-all"
-          style={{
-            borderColor: isRunning || !imagePath ? 'var(--text-dim)' : 'var(--cyber-blue)',
-            color: isRunning || !imagePath ? 'var(--text-dim)' : 'var(--cyber-blue)',
-            background: isRunning || !imagePath ? 'var(--bg-secondary)' : 'rgba(0,212,255,0.08)',
-            opacity: isRunning || !imagePath ? 0.6 : 1,
-            cursor: isRunning || !imagePath ? 'not-allowed' : 'pointer',
-          }}
-        >
-          {isRunning ? '⏳ A GERAR...' : '🎬 GERAR VÍDEO'}
-        </button>
-        {isRunning && (
+        <div className="flex items-end gap-3 mb-3">
+          <div>
+            <label className={labelCls}>Duração</label>
+            <select
+              value={duration}
+              onChange={(e) => setDuration(parseInt(e.target.value, 10))}
+              disabled={isBusy}
+              className="input-glow text-[12px] px-3 py-2"
+            >
+              {DURATIONS.map(d => (
+                <option key={d} value={d}>{d}s ({Math.ceil(d / 5)} chunks)</option>
+              ))}
+            </select>
+          </div>
           <button
-            onClick={clearJob}
-            className="px-3 py-2 rounded-lg text-xs font-mono border"
-            style={{ borderColor: 'var(--alert-red)', color: 'var(--alert-red)', background: 'rgba(255,59,48,0.08)' }}
+            onClick={generateStoryboard}
+            disabled={!scene.trim() || storyboardLoading}
+            className="btn-glow px-4 py-2 rounded-lg font-mono text-[11px] font-bold tracking-wider uppercase transition-all"
+            style={{
+              opacity: (!scene.trim() || storyboardLoading) ? 0.4 : 1,
+              cursor: (!scene.trim() || storyboardLoading) ? 'not-allowed' : 'pointer',
+              background: 'var(--bg-secondary)',
+              color: 'var(--cyber-blue)',
+              border: '1px solid rgba(0,200,255,0.3)',
+            }}
           >
-            ✕ Cancelar
+            {storyboardLoading ? 'A gerar...' : 'Gerar Script'}
           </button>
+        </div>
+
+        {/* Prompt list */}
+        {prompts.length > 0 && (
+          <div className="space-y-2 mt-3">
+            <div className="text-[10px] font-mono uppercase mb-1" style={{ color: 'var(--text-secondary)' }}>
+              Prompts ({prompts.length} chunks) — editável
+            </div>
+            {prompts.map((p, i) => {
+              const wordCount = p.trim().split(/\s+/).length;
+              const overLimit = wordCount > 15;
+              return (
+                <div key={i} className="flex items-center gap-2">
+                  <span className="text-[10px] font-mono flex-shrink-0 w-16" style={{ color: 'var(--text-muted)' }}>
+                    Chunk {i + 1}
+                  </span>
+                  <input
+                    type="text"
+                    className="input-glow flex-1 text-[12px]"
+                    value={p}
+                    onChange={(e) => updatePrompt(i, e.target.value)}
+                    disabled={generating}
+                    style={{ borderColor: overLimit ? 'var(--alert-red)' : 'var(--border-subtle)' }}
+                  />
+                  <span className="text-[9px] font-mono flex-shrink-0" style={{ color: overLimit ? 'var(--alert-red)' : 'var(--text-dim)' }}>
+                    {wordCount}/15
+                  </span>
+                </div>
+              );
+            })}
+          </div>
         )}
       </div>
 
+      {/* Negative prompt */}
+      <div>
+        <label className={labelCls}>Prompt negativo (partilhado)</label>
+        <textarea
+          className={inputCls}
+          rows={2}
+          value={negative}
+          onChange={(e) => setNegative(e.target.value)}
+          disabled={generating}
+        />
+      </div>
+
+      {/* Advanced parameters */}
+      <div className="rounded-lg border" style={{ borderColor: 'var(--border-subtle)', background: 'var(--bg-card)' }}>
+        <button
+          onClick={() => setShowAdvanced(!showAdvanced)}
+          className="w-full flex items-center justify-between px-3 py-2 text-left transition-colors hover:bg-[var(--bg-hover)]"
+        >
+          <span className="text-[10px] font-mono uppercase tracking-wider" style={{ color: 'var(--text-secondary)' }}>
+            ⚙ Parâmetros avançados
+          </span>
+          <span className="text-[10px] font-mono" style={{ color: 'var(--text-muted)' }}>
+            {showAdvanced ? '−' : '+'}
+          </span>
+        </button>
+        {showAdvanced && (
+          <div className="px-3 pb-3 flex flex-wrap gap-4">
+            <div>
+              <label className={labelCls}>Steps (4-20)</label>
+              <input
+                type="number" min={4} max={20}
+                value={steps}
+                onChange={(e) => setSteps(parseInt(e.target.value, 10) || 8)}
+                disabled={generating}
+                className="input-glow w-16 text-center text-[12px]"
+              />
+            </div>
+            <div>
+              <label className={labelCls}>CFG (1.0-3.0)</label>
+              <input
+                type="number" min={1} max={3} step={0.1}
+                value={cfg}
+                onChange={(e) => setCfg(parseFloat(e.target.value) || 1.5)}
+                disabled={generating}
+                className="input-glow w-16 text-center text-[12px]"
+              />
+            </div>
+            <div>
+              <label className={labelCls}>Seed (-1 = aleatório)</label>
+              <input
+                type="text"
+                value={seed}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === '-' || v === '') { setSeed(-1); return; }
+                  const n = parseInt(v, 10);
+                  setSeed(isNaN(n) ? -1 : n);
+                }}
+                disabled={generating}
+                className="input-glow w-28 text-center text-[12px]"
+              />
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Generate button */}
+      <button
+        onClick={generateVideo}
+        disabled={!imageFilename || prompts.length === 0 || generating}
+        className="btn-glow px-6 py-3 rounded-lg font-mono text-[12px] font-bold tracking-wider uppercase transition-all duration-300"
+        style={{
+          opacity: (!imageFilename || prompts.length === 0 || generating) ? 0.4 : 1,
+          cursor: (!imageFilename || prompts.length === 0 || generating) ? 'not-allowed' : 'pointer',
+          background: 'var(--bg-card)',
+          color: 'var(--cyber-blue)',
+          border: '1px solid rgba(0,200,255,0.3)',
+          boxShadow: (!imageFilename || prompts.length === 0 || generating) ? 'none' : '0 2px 12px rgba(0,200,255,0.15)',
+        }}
+      >
+        {generating ? 'A gerar...' : '🎬 Gerar Video'}
+      </button>
+
       {/* Status */}
-      {progressMsg && (
-        <div className="rounded-lg p-3 text-xs font-mono border" style={{
-          background: status === 'error' ? 'rgba(255,59,48,0.08)' : status === 'done' ? 'rgba(0,255,65,0.08)' : 'var(--bg-card)',
-          borderColor: status === 'error' ? 'var(--alert-red)' : status === 'done' ? 'var(--matrix-green)' : 'var(--border-subtle)',
-          color: status === 'error' ? 'var(--alert-red)' : status === 'done' ? 'var(--matrix-green)' : 'var(--text-secondary)',
+      {statusMsg && (
+        <div className="text-[11px] font-mono" style={{
+          color: statusType === 'error' ? 'var(--alert-red)' : statusType === 'success' ? 'var(--matrix-green)' : 'var(--text-secondary)',
         }}>
-          {progressMsg}
+          {statusMsg}
+        </div>
+      )}
+
+      {/* Progress bar */}
+      {generating && (
+        <div className="space-y-1">
+          {/* Sampling progress (value/max from ComfyUI) */}
+          {progress && progress.max > 0 && (
+            <>
+              <div className="flex items-center justify-between text-[10px] font-mono" style={{ color: 'var(--text-muted)' }}>
+                <span>A amostrar: {progress.value}/{progress.max} (step {progress.step})</span>
+                <span className="animate-pulse">● KSampler</span>
+              </div>
+              <div className="h-2 rounded-full overflow-hidden" style={{ background: 'var(--bg-secondary)' }}>
+                <div
+                  className="h-full rounded-full transition-all duration-300"
+                  style={{
+                    width: `${Math.round((progress.value / progress.max) * 100)}%`,
+                    background: 'linear-gradient(90deg, var(--cyber-blue), var(--matrix-green))',
+                  }}
+                />
+              </div>
+            </>
+          )}
+          {/* Node execution counter (fallback when no sampling progress) */}
+          {wsNodeCount > 0 && (!progress || !progress.max) && (
+            <>
+              <div className="flex items-center justify-between text-[10px] font-mono" style={{ color: 'var(--text-muted)' }}>
+                <span>Nodes executados: {wsNodeCount}</span>
+                <span className="animate-pulse">● A processar...</span>
+              </div>
+              <div className="h-2 rounded-full overflow-hidden" style={{ background: 'var(--bg-secondary)' }}>
+                <div
+                  className="h-full rounded-full transition-all duration-500"
+                  style={{
+                    width: '100%',
+                    background: 'linear-gradient(90deg, var(--cyber-blue), var(--matrix-green))',
+                  }}
+                />
+              </div>
+            </>
+          )}
+          {/* Waiting state — WS connected but no events yet */}
+          {wsNodeCount === 0 && (!progress || !progress.max) && (
+            <div className="flex items-center justify-between text-[10px] font-mono" style={{ color: 'var(--text-muted)' }}>
+              <span className="animate-pulse">● À espera do ComfyUI...</span>
+            </div>
+          )}
         </div>
       )}
 
       {/* Result */}
-      {resultVideo && (
-        <div className="rounded-lg p-3 border" style={{ borderColor: 'var(--matrix-green)', background: 'rgba(0,255,65,0.05)' }}>
-          <div className="text-[10px] font-mono mb-2" style={{ color: 'var(--matrix-green)' }}>✓ Vídeo no Media Pool</div>
-          <video controls className="w-full rounded" style={{ maxHeight: 200 }}>
-            <source src={`${API_BASE}/api/media/file/${encodeURIComponent(resultVideo)}`} />
-          </video>
+      {resultVideo && resultUrl && (
+        <div className="rounded-lg border overflow-hidden" style={{ borderColor: 'var(--border-subtle)', background: 'var(--bg-card)' }}>
+          <div className="px-3 py-2 border-b flex items-center justify-between" style={{ borderColor: 'var(--border-subtle)' }}>
+            <span className="text-[10px] font-mono" style={{ color: 'var(--text-secondary)' }}>▶ Resultado</span>
+            <div className="flex gap-2">
+              <button
+                onClick={sendToPool}
+                className="btn-glow px-3 py-1 rounded font-mono text-[10px] tracking-wider border"
+                style={{ background: 'var(--bg-secondary)', borderColor: 'var(--matrix-green)', color: 'var(--matrix-green)' }}
+              >
+                📦 Enviar para Media Pool
+              </button>
+              <button
+                onClick={extendVideo}
+                disabled={postProcessing}
+                className="btn-glow px-3 py-1 rounded font-mono text-[10px] tracking-wider border"
+                style={{ background: 'var(--bg-secondary)', borderColor: 'var(--amber-warn)', color: 'var(--amber-warn)', opacity: postProcessing ? 0.4 : 1 }}
+              >
+                ⏩ Extender Video
+              </button>
+            </div>
+          </div>
+          <video
+            src={`${API_BASE}${resultUrl}`}
+            controls
+            className="w-full"
+            style={{ display: 'block', maxHeight: 400 }}
+          />
+          <div className="px-3 py-2 text-[10px] font-mono" style={{ background: 'var(--bg-secondary)', color: 'var(--text-dim)' }}>
+            {resultVideo}
+          </div>
+        </div>
+      )}
+
+      {/* Post-Process section — always available */}
+      {!generating && (
+        <div className="rounded-lg border" style={{ borderColor: 'var(--border-subtle)', background: 'var(--bg-card)' }}>
+          <div className="px-3 py-2 border-b" style={{ borderColor: 'var(--border-subtle)' }}>
+            <span className="text-[10px] font-mono uppercase tracking-wider" style={{ color: 'var(--text-secondary)' }}>
+              ✦ Pós-processamento (RIFE + Upscale)
+            </span>
+          </div>
+          <div className="px-3 py-3 flex flex-wrap items-end gap-4">
+            <div>
+              <label className={labelCls}>Vídeo de entrada</label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="file"
+                  accept="video/*"
+                  onChange={handlePpVideoUpload}
+                  disabled={postProcessing}
+                  className="text-[10px] font-mono"
+                  style={{ maxWidth: 220 }}
+                />
+                {ppVideoFilename && (
+                  <span className="text-[10px] font-mono" style={{ color: 'var(--matrix-green)' }}>✓ {ppVideoFilename}</span>
+                )}
+                {resultVideo && !ppVideoFilename && (
+                  <span className="text-[10px] font-mono" style={{ color: 'var(--text-dim)' }}>→ usa vídeo gerado</span>
+                )}
+              </div>
+            </div>
+            <div>
+              <label className={labelCls}>FPS (interpolação RIFE)</label>
+              <select
+                value={fps}
+                onChange={(e) => setFps(parseInt(e.target.value, 10))}
+                disabled={postProcessing}
+                className="input-glow text-[12px] px-2 py-1.5"
+              >
+                <option value={16}>16 (nativo — sem interpolação)</option>
+                <option value={32}>32 (RIFE 2x)</option>
+                <option value={64}>64 (RIFE 4x)</option>
+              </select>
+            </div>
+            <div>
+              <label className={labelCls}>Upscale</label>
+              <select
+                value={upscale}
+                onChange={(e) => setUpscale(parseInt(e.target.value, 10))}
+                disabled={postProcessing}
+                className="input-glow text-[12px] px-2 py-1.5"
+              >
+                <option value={1}>1x (original)</option>
+                <option value={2}>2x</option>
+                <option value={4}>4x</option>
+              </select>
+            </div>
+            <button
+              onClick={runPostprocess}
+              disabled={postProcessing || (fps === 16 && upscale === 1) || (!ppVideoFilename && !resultVideo)}
+              className="btn-glow px-4 py-2 rounded-lg font-mono text-[11px] font-bold tracking-wider uppercase transition-all"
+              style={{
+                opacity: (postProcessing || (fps === 16 && upscale === 1) || (!ppVideoFilename && !resultVideo)) ? 0.4 : 1,
+                cursor: (postProcessing || (fps === 16 && upscale === 1) || (!ppVideoFilename && !resultVideo)) ? 'not-allowed' : 'pointer',
+                background: 'var(--bg-secondary)',
+                color: 'var(--amber-warn)',
+                border: '1px solid rgba(255,184,0,0.3)',
+              }}
+            >
+              {postProcessing ? 'A processar...' : '✦ Melhorar Vídeo'}
+            </button>
+          </div>
+          {(fps === 16 && upscale === 1) && (
+            <div className="px-3 pb-2 text-[10px] font-mono" style={{ color: 'var(--text-dim)' }}>
+              Seleciona FPS &gt; 16 ou Upscale &gt; 1x para ativar o pós-processamento.
+            </div>
+          )}
         </div>
       )}
     </div>
   );
 }
-
-export default VideoGenerator;

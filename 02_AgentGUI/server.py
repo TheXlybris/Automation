@@ -48,6 +48,47 @@ app = Flask(__name__, static_folder='static', static_url_path='/')
 CORS(app, origins="*")
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
+# ─── Error log (JSONL) ───────────────────────────────────
+# ponytail: single errorhandler, append-only JSONL. No log rotation, no framework.
+# Upgrade: rotate when file >10MB if disk matters.
+from werkzeug.exceptions import HTTPException
+import traceback as _tb
+
+_ERROR_LOG = project_root / "logs" / "errors.jsonl"
+_ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
+
+@app.errorhandler(Exception)
+def _log_unhandled(exc):
+    if isinstance(exc, HTTPException):
+        return exc  # let Flask handle 404/400 etc.
+    # Category from URL prefix → agent can search_files by category
+    path = request.path
+    if "/api/video" in path: cat = "video"
+    elif "/api/media" in path: cat = "media"
+    elif "/api/agents" in path: cat = "agents"
+    elif "/api/profiles" in path: cat = "profiles"
+    elif "/api/cron" in path: cat = "cron"
+    elif "/socket" in path: cat = "socket"
+    else: cat = "other"
+    entry = {
+        "ts": datetime.now().isoformat(),
+        "endpoint": path,
+        "method": request.method,
+        "category": cat,
+        "error": str(exc),
+        "traceback": _tb.format_exc(),
+    }
+    try:
+        with open(_ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass  # never crash the errorhandler
+    return jsonify({"error": str(exc), "detail": _tb.format_exc()}), 500
+
+@app.errorhandler(404)
+def _log_404(exc):
+    return jsonify({"error": "Not found", "path": request.path}), 404
+
 # Import core modules
 try:
     from core.state import (
@@ -264,6 +305,9 @@ def list_models() -> dict:
         {"id": "glm-5.2", "name": "glm-5.2", "size": None, "source": "cloud"},
         {"id": "deepseek-v4-pro", "name": "deepseek-v4-pro", "size": None, "source": "cloud"},
         {"id": "qwen3-coder:480b", "name": "qwen3-coder 480b", "size": None, "source": "cloud"},
+        {"id": "qwen3.5:397b", "name": "qwen3.5 397b", "size": None, "source": "cloud"},
+        {"id": "mistral-large-3:675b", "name": "mistral-large-3 675b", "size": None, "source": "cloud"},
+        {"id": "minimax-m3", "name": "minimax-m3", "size": None, "source": "cloud"},
     ]
     for cm in cloud_defaults:
         if cm["id"] not in seen_base_names:
@@ -358,6 +402,36 @@ for f in MEDIA_TEMP_DIR.iterdir():
         f.unlink()
     except Exception:
         pass
+
+# ─── Media helpers ───────────────────────────────────
+
+import mimetypes
+mimetypes.add_type("video/mp4", ".mp4")
+mimetypes.add_type("video/webm", ".webm")
+mimetypes.add_type("video/quicktime", ".mov")
+mimetypes.add_type("audio/mpeg", ".mp3")
+mimetypes.add_type("audio/wav", ".wav")
+
+def _probe_duration(f):
+    """ffprobe with 15s timeout (shared folders can be slow)."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(f)],
+            capture_output=True, text=True, timeout=15
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            return float(data.get("format", {}).get("duration", 0))
+    except Exception:
+        pass
+    return None
+
+def _human_size(n):
+    for unit in ["B", "KB", "MB", "GB"]:
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
 
 # ─── REST API Routes ──────────────────────────────────
 
@@ -699,48 +773,36 @@ def api_media_list():
     files = []
     for f in sorted(MEDIA_TEMP_DIR.iterdir()):
         if f.is_file() and not f.name.startswith("."):
-            # Try to get duration via ffprobe
-            duration = None
-            try:
-                result = subprocess.run(
-                    ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(f)],
-                    capture_output=True, text=True, timeout=5
-                )
-                if result.returncode == 0:
-                    data = json.loads(result.stdout)
-                    duration = float(data.get("format", {}).get("duration", 0))
-            except Exception:
-                pass
+            duration = _probe_duration(f)
+            size = f.stat().st_size
             files.append({
                 "name": f.name,
-                "size": f.stat().st_size,
+                "size": size,
+                "size_human": _human_size(size),
                 "duration": duration,
                 "duration_human": f"{int(duration//60)}:{int(duration%60):02d}" if duration else None
             })
-    return jsonify(files)
+    return jsonify({"files": files})
 
 @app.route("/api/media/file/<filename>")
 def api_media_file(filename):
     f = MEDIA_TEMP_DIR / filename
-    if f.exists():
-        return send_file(str(f))
-    return jsonify({"error": "not found"}), 404
+    if not f.exists():
+        return jsonify({"error": "not found"}), 404
+    mime, _ = mimetypes.guess_type(str(f))
+    if not mime:
+        mime = "application/octet-stream"
+    return send_file(str(f), mimetype=mime, conditional=True)
 
 @app.route("/api/media/duration/<filename>")
 def api_media_duration(filename):
     f = MEDIA_TEMP_DIR / filename
     if not f.exists():
         return jsonify({"error": "not found"}), 404
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(f)],
-            capture_output=True, text=True, timeout=5
-        )
-        data = json.loads(result.stdout)
-        duration = float(data.get("format", {}).get("duration", 0))
+    duration = _probe_duration(f)
+    if duration is not None:
         return jsonify({"duration": duration})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    return jsonify({"error": "ffprobe failed"}), 500
 
 @app.route("/api/media/thumbnail/<filename>")
 def api_media_thumbnail(filename):
@@ -769,6 +831,498 @@ def api_media_delete(filename):
     if thumb.exists():
         thumb.unlink()
     return jsonify({"success": True})
+
+# ── Media Export (concat via FFmpeg with optional crossfade) ──
+
+@app.route("/api/media/export", methods=["POST"])
+def api_media_export():
+    """Concatena clips da timeline num único ficheiro.
+    Body: {"clips": [{"label": "file.mp4", "start": 0, "length": 5.0}, ...], "crossfade": 0.5}
+    crossfade: duração em segundos do crossfade entre clips (default 0 = hard cut)
+    """
+    data = request.get_json(force=True)
+    clips = data.get("clips", [])
+    crossfade = float(data.get("crossfade", 0))
+    if not clips:
+        return jsonify({"error": "no clips"}), 400
+
+    clips.sort(key=lambda c: c.get("start", 0))
+
+    # Verificar ficheiros
+    file_list = []
+    for c in clips:
+        fname = c.get("label", "")
+        f = MEDIA_TEMP_DIR / fname
+        if not f.exists():
+            return jsonify({"error": f"file not found: {fname}"}), 404
+        file_list.append(str(f))
+
+    output_name = f"export_{int(time.time())}.mp4"
+    output_path = MEDIA_TEMP_DIR / output_name
+
+    if len(file_list) == 1 or crossfade <= 0:
+        # Hard cut: concat demuxer (fast)
+        list_file = MEDIA_TEMP_DIR / "_concat_list.txt"
+        with open(list_file, "w") as lf:
+            for fp in file_list:
+                lf.write(f"file '{fp}'\n")
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
+                 "-c", "copy", str(output_path)],
+                capture_output=True, text=True, timeout=120
+            )
+            if result.returncode != 0:
+                result = subprocess.run(
+                    ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
+                     "-c:v", "libx264", "-c:a", "aac", "-preset", "fast", str(output_path)],
+                    capture_output=True, text=True, timeout=600
+                )
+                if result.returncode != 0:
+                    return jsonify({"error": "ffmpeg failed", "stderr": result.stderr[-500:]}), 500
+        except subprocess.TimeoutExpired:
+            return jsonify({"error": "timeout"}), 500
+        list_file.unlink(missing_ok=True)
+    else:
+        # Crossfade: xfade filter chain
+        # Build FFmpeg xfade chain: each transition overlaps by crossfade seconds
+        # xfade=transition=fade:duration=X:offset=Y
+        n = len(file_list)
+        inputs = []
+        for fp in file_list:
+            inputs.extend(["-i", fp])
+
+        # Get durations for offset calculation
+        durations = []
+        for fp in file_list:
+            d = _probe_duration(Path(fp))
+            durations.append(d if d else 5.0)
+
+        # Build filter chain
+        # ponytail: xfade chain O(n) filters, fine for <20 clips
+        filter_parts = []
+        prev_label = "[0:v]"
+        cum_offset = 0.0
+        for i in range(1, n):
+            # offset = cumulative duration - crossfade (overlap)
+            cum_offset += durations[i-1] - crossfade
+            out_label = f"[v{i}]" if i < n-1 else "[vout]"
+            filter_parts.append(
+                f"{prev_label}[{i}]:v]xfade=transition=fade:duration={crossfade}:offset={cum_offset:.3f}{out_label}"
+            )
+            prev_label = f"[v{i}]"
+        filter_complex = ";".join(filter_parts)
+
+        # Audio: concat (crossfade only video, audio hard-cut for simplicity)
+        audio_filter = ""
+        if n > 1:
+            audio_inputs = "".join(f"[{i}:a]" for i in range(n))
+            audio_filter = f";{audio_inputs}concat=n={n}:v=0:a=1[aout]"
+
+        full_filter = filter_complex + audio_filter
+        cmd = ["ffmpeg", "-y"] + inputs + ["-filter_complex", full_filter,
+               "-map", "[vout]" if n > 1 else "[0:v]"]
+        if audio_filter:
+            cmd.extend(["-map", "[aout]"])
+        else:
+            cmd.extend(["-map", "0:a?"])
+        cmd.extend(["-c:v", "libx264", "-c:a", "aac", "-preset", "fast", str(output_path)])
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if result.returncode != 0:
+                return jsonify({"error": "ffmpeg xfade failed", "stderr": result.stderr[-800:]}), 500
+        except subprocess.TimeoutExpired:
+            return jsonify({"error": "timeout"}), 500
+
+    return jsonify({"success": True, "filename": output_name, "url": f"/api/media/file/{output_name}"})
+
+# ── ComfyUI Image Generation ──
+
+COMFYUI_HOST = os.environ.get("COMFYUI_HOST", "http://192.168.0.187:8188")
+WORKFLOWS_DIR = Path("/media/sf_AI_Ecosystem/03_Workflows/API")
+COMFYUI_OUTPUT_DIR = Path("/media/sf_AI_Ecosystem/02_Engines/ComfyUI/ComfyUI/output")
+
+# Workflow registry — maps frontend keys to workflow files + defaults
+WORKFLOW_REGISTRY = {
+    "fantasy": {
+        "file": "Text2Image_Fantasy.json",
+        "label": "Fantasy/Animation (SDXL)",
+        "defaults": {"steps": 30, "cfg": 7, "width": 1024, "height": 576},
+    },
+    "realistic": {
+        "file": "Text2Image.json",
+        "label": "Realistic (SDXL)",
+        "defaults": {"steps": 30, "cfg": 7, "width": 1024, "height": 576},
+    },
+}
+
+@app.route("/api/image/workflows")
+def api_image_workflows():
+    """List available workflows with defaults."""
+    workflows = []
+    for key, info in WORKFLOW_REGISTRY.items():
+        workflows.append({"key": key, "label": info["label"], "defaults": info["defaults"]})
+    return jsonify(workflows)
+
+@app.route("/api/image/generate", methods=["POST"])
+def api_image_generate():
+    """Submit a text2img workflow to ComfyUI."""
+    data = request.json or {}
+    wf_key = data.get("workflow", "realistic")
+    wf_info = WORKFLOW_REGISTRY.get(wf_key, WORKFLOW_REGISTRY["realistic"])
+    wf_path = WORKFLOWS_DIR / wf_info["file"]
+
+    if not wf_path.exists():
+        return jsonify({"error": f"Workflow file not found: {wf_path}"}), 500
+
+    try:
+        workflow = json.loads(wf_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return jsonify({"error": f"Failed to parse workflow: {e}"}), 500
+
+    # Inject parameters into workflow nodes
+    prompt_text = data.get("prompt", "")
+    negative_text = data.get("negative", "text, watermark")
+    width = int(data.get("width", wf_info["defaults"]["width"]))
+    height = int(data.get("height", wf_info["defaults"]["height"]))
+    steps = int(data.get("steps", wf_info["defaults"]["steps"]))
+    cfg = float(data.get("cfg", wf_info["defaults"]["cfg"]))
+    seed = int(data.get("seed", -1))
+    batch_size = int(data.get("batch_size", 1))
+
+    if seed == -1:
+        import random
+        seed = random.randint(0, 2**32 - 1)
+
+    # Find nodes by class_type and inject
+    for node_id, node in workflow.items():
+        ct = node.get("class_type", "")
+        inputs = node.get("inputs", {})
+        if ct == "CLIPTextEncode":
+            # Node 6 = positive, Node 7 = negative (convention)
+            if node_id == "6":
+                # For fantasy workflow, prepend style modifiers to user prompt
+                if wf_key == "fantasy":
+                    inputs["text"] = "fantasy animation style, concept art, cartoon shading, whimsical, masterpiece, best quality, highly detailed, " + prompt_text
+                else:
+                    inputs["text"] = prompt_text
+            elif node_id == "7":
+                if wf_key == "fantasy":
+                    inputs["text"] = negative_text if negative_text != "text, watermark" else "photorealistic, realistic, photo, photograph, 3d render, octane render, text, watermark, blurry, low quality, worst quality, deformed, ugly, realistic skin, real person"
+                else:
+                    inputs["text"] = negative_text
+        elif ct == "EmptyLatentImage":
+            inputs["width"] = width
+            inputs["height"] = height
+            inputs["batch_size"] = batch_size
+        elif ct == "KSampler":
+            inputs["seed"] = seed
+            inputs["steps"] = steps
+            inputs["cfg"] = cfg
+
+    # Submit to ComfyUI
+    client_id = uuid.uuid4().hex
+    payload = {"prompt": workflow, "client_id": client_id}
+
+    try:
+        resp = _requests.post(f"{COMFYUI_HOST}/prompt", json=payload, timeout=30)
+        result = resp.json()
+    except Exception as e:
+        return jsonify({"error": f"ComfyUI connection failed: {e}"}), 502
+
+    if "node_errors" in result and result["node_errors"]:
+        return jsonify({"error": f"Node errors: {json.dumps(result['node_errors'])}"}), 400
+
+    prompt_id = result.get("prompt_id", "")
+    total_steps = steps
+
+    return jsonify({
+        "success": True,
+        "prompt_id": prompt_id,
+        "seed": seed,
+        "total_steps": total_steps,
+    })
+
+@app.route("/api/image/status/<prompt_id>")
+def api_image_status(prompt_id):
+    """Check ComfyUI job status and return images when done."""
+    try:
+        resp = _requests.get(f"{COMFYUI_HOST}/history/{prompt_id}", timeout=10)
+        history = resp.json()
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 502
+
+    if prompt_id not in history:
+        return jsonify({"status": "queued"})
+
+    entry = history[prompt_id]
+    status = entry.get("status", {})
+    status_str = status.get("status_str", "")
+    completed = status.get("completed", False)
+
+    if status_str == "error":
+        return jsonify({"status": "error", "error": "Workflow execution failed"})
+
+    if not completed:
+        return jsonify({"status": "running"})
+
+    # Extract output images
+    images = []
+    outputs = entry.get("outputs", {})
+    for node_id, node_output in outputs.items():
+        for img in node_output.get("images", []):
+            filename = img.get("filename", "")
+            subfolder = img.get("subfolder", "")
+            img_type = img.get("type", "output")
+            view_url = f"{COMFYUI_HOST}/view?filename={filename}&subfolder={subfolder}&type={img_type}"
+            # Proxy through AgentGUI to avoid CORS issues
+            proxy_url = f"/api/image/view?filename={filename}&subfolder={subfolder}&type={img_type}"
+            images.append({
+                "url": proxy_url,
+                "filename": filename,
+                "server_path": str(COMFYUI_OUTPUT_DIR / filename) if COMFYUI_OUTPUT_DIR.exists() else filename,
+            })
+
+    return jsonify({"status": "done", "images": images})
+
+@app.route("/api/image/view")
+def api_image_view():
+    """Proxy ComfyUI image output to avoid CORS issues."""
+    filename = request.args.get("filename", "")
+    subfolder = request.args.get("subfolder", "")
+    img_type = request.args.get("type", "output")
+    if not filename:
+        return jsonify({"error": "filename required"}), 400
+
+    try:
+        resp = _requests.get(
+            f"{COMFYUI_HOST}/view",
+            params={"filename": filename, "subfolder": subfolder, "type": img_type},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return jsonify({"error": "image not found"}), 404
+        return Response(resp.content, content_type=resp.headers.get("Content-Type", "image/png"))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+@app.route("/api/image/output-folder")
+def api_image_output_folder():
+    """Return the path to the ComfyUI output folder (both VM and Windows paths)."""
+    vm_path = str(COMFYUI_OUTPUT_DIR)
+    # Shared folder /media/sf_AI_Ecosystem/ maps to D:\AI_Ecosystem\ on Windows
+    win_path = vm_path.replace("/media/sf_AI_Ecosystem/", "D:\\AI_Ecosystem\\").replace("/", "\\")
+    return jsonify({"path": vm_path, "windows_path": win_path})
+
+@app.route("/api/open-folder")
+def api_open_folder():
+    """Open a folder in the host file manager (VM: xdg-open, Windows: via shared folder)."""
+    folder = request.args.get("path", "")
+    if not folder:
+        return jsonify({"error": "path required"}), 400
+    p = Path(folder)
+    if not p.exists():
+        return jsonify({"error": f"Path not found: {folder}"}), 404
+    try:
+        subprocess.Popen(["xdg-open", str(p)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ── Video Generation (Wan 2.2 pipeline) ──
+try:
+    from video_endpoints import register_video_endpoints
+    register_video_endpoints(app)
+except Exception as e:
+    print(f"[WARN] video_endpoints import failed: {e}")
+
+# ── Video Analyzer (video-analyze.py: motion / drift / sharpness) ──
+
+VIDEO_ANALYZE_SCRIPT = Path("/media/sf_AI_Ecosystem/05_Scripts/video-analyze.py")
+VIDEO_ANALYZE_PYTHON = "/usr/bin/python3"
+VIDEO_OUTPUT_DIR = COMFYUI_OUTPUT_DIR / "video"
+
+# In-memory job tracker for async analyzer runs
+_analyze_jobs = {}  # job_id -> {status, output, plot_path, json_path, error, started, filename}
+_analyze_jobs_lock = threading.Lock()
+
+
+def _run_analyzer_thread(job_id, video_path, grid, content=False, model="qwen3.5:397b", frames=5):
+    """Background worker that runs video-analyze.py and stores results."""
+    try:
+        cmd = [VIDEO_ANALYZE_PYTHON, str(VIDEO_ANALYZE_SCRIPT), "--json"]
+        if grid and int(grid) > 0:
+            cmd += ["--grid", str(int(grid))]
+        if content:
+            cmd += ["--content", "--model", model, "--frames", str(int(frames))]
+        cmd.append(str(video_path))
+
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600 if not content else 900,
+        )
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        rc = proc.returncode
+
+        stem = os.path.splitext(str(video_path))[0]
+        plot_path = stem + "_analysis.png"
+        json_path = stem + "_analysis.json"
+
+        with _analyze_jobs_lock:
+            if rc == 0:
+                _analyze_jobs[job_id] = {
+                    "status": "done",
+                    "output": stdout,
+                    "stderr": stderr,
+                    "plot_path": plot_path,
+                    "json_path": json_path,
+                    "plot_exists": os.path.exists(plot_path),
+                    "json_exists": os.path.exists(json_path),
+                    "filename": os.path.basename(str(video_path)),
+                    "finished": time.time(),
+                }
+            else:
+                _analyze_jobs[job_id] = {
+                    "status": "error",
+                    "output": stdout,
+                    "stderr": stderr,
+                    "error": f"Analyzer exited with code {rc}",
+                    "plot_path": plot_path,
+                    "json_path": json_path,
+                    "plot_exists": os.path.exists(plot_path),
+                    "filename": os.path.basename(str(video_path)),
+                    "finished": time.time(),
+                }
+    except subprocess.TimeoutExpired:
+        with _analyze_jobs_lock:
+            _analyze_jobs[job_id] = {
+                "status": "error",
+                "error": "Analyzer timeout (900s)" if content else "Analyzer timeout (600s)",
+                "filename": os.path.basename(str(video_path)),
+                "finished": time.time(),
+            }
+    except Exception as e:
+        with _analyze_jobs_lock:
+            _analyze_jobs[job_id] = {
+                "status": "error",
+                "error": str(e),
+                "filename": os.path.basename(str(video_path)),
+                "finished": time.time(),
+            }
+
+
+@app.route("/api/video-analyze/list")
+def api_video_analyze_list():
+    """List .mp4 files in ComfyUI output/video/ sorted by mtime (newest first)."""
+    if not VIDEO_OUTPUT_DIR.exists():
+        return jsonify({"error": f"Output dir not found: {VIDEO_OUTPUT_DIR}", "videos": []}), 200
+    try:
+        videos = []
+        for f in VIDEO_OUTPUT_DIR.iterdir():
+            if f.is_file() and f.suffix.lower() == ".mp4":
+                st = f.stat()
+                videos.append({
+                    "filename": f.name,
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                    "mtime_iso": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
+                })
+        videos.sort(key=lambda v: v["mtime"], reverse=True)
+        return jsonify({"videos": videos, "path": str(VIDEO_OUTPUT_DIR)})
+    except Exception as e:
+        return jsonify({"error": str(e), "videos": []}), 500
+
+
+@app.route("/api/video-analyze/run", methods=["POST"])
+def api_video_analyze_run():
+    """Start analyzer on a video. Returns job_id for polling."""
+    data = request.json or {}
+    filename = data.get("filename", "")
+    manual_path = data.get("path", "")
+    grid = int(data.get("grid", 0) or 0)
+    content = bool(data.get("content", False))
+    model = data.get("model", "qwen3.5:397b")
+    frames = int(data.get("frames", 5) or 5)
+
+    # Resolve video path
+    if manual_path:
+        video_path = Path(manual_path)
+        if not video_path.exists():
+            return jsonify({"error": f"File not found: {manual_path}"}), 404
+    elif filename:
+        video_path = VIDEO_OUTPUT_DIR / filename
+        if not video_path.exists():
+            return jsonify({"error": f"Video not found: {filename}"}), 404
+    else:
+        return jsonify({"error": "Provide 'filename' or 'path'"}), 400
+
+    if not VIDEO_ANALYZE_SCRIPT.exists():
+        return jsonify({"error": f"Analyzer script not found: {VIDEO_ANALYZE_SCRIPT}"}), 500
+
+    job_id = uuid.uuid4().hex
+    with _analyze_jobs_lock:
+        _analyze_jobs[job_id] = {
+            "status": "running",
+            "filename": video_path.name,
+            "started": time.time(),
+        }
+
+    t = threading.Thread(
+        target=_run_analyzer_thread,
+        args=(job_id, str(video_path), grid),
+        kwargs={"content": content, "model": model, "frames": frames},
+        daemon=True,
+    )
+    t.start()
+
+    return jsonify({"success": True, "job_id": job_id, "filename": video_path.name})
+
+
+@app.route("/api/video-analyze/status/<job_id>")
+def api_video_analyze_status(job_id):
+    """Poll analyzer job status."""
+    with _analyze_jobs_lock:
+        job = _analyze_jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "job not found"}), 404
+        return jsonify(job)
+
+
+@app.route("/api/video-analyze/plot")
+def api_video_analyze_plot():
+    """Serve the _analysis.png for a video filename."""
+    filename = request.args.get("filename", "")
+    if not filename:
+        return jsonify({"error": "filename required"}), 400
+    # Security: only basename
+    filename = os.path.basename(filename)
+    stem = os.path.splitext(filename)[0]
+    plot_path = VIDEO_OUTPUT_DIR / f"{stem}_analysis.png"
+    if not plot_path.exists():
+        return jsonify({"error": "plot not found"}), 404
+    return send_file(str(plot_path), mimetype="image/png")
+
+
+@app.route("/api/video-analyze/json")
+def api_video_analyze_json():
+    """Serve the _analysis.json for a video filename."""
+    filename = request.args.get("filename", "")
+    if not filename:
+        return jsonify({"error": "filename required"}), 400
+    filename = os.path.basename(filename)
+    stem = os.path.splitext(filename)[0]
+    json_path = VIDEO_OUTPUT_DIR / f"{stem}_analysis.json"
+    if not json_path.exists():
+        return jsonify({"error": "json not found"}), 404
+    try:
+        return Response(json_path.read_text(), mimetype="application/json")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 # ── Restart ──
 
@@ -1400,6 +1954,409 @@ def orchestrator_subprocess_worker():
         # Restart after 5s
         time.sleep(5)
 
+# ─── Tools: Prompt Log & Prompt Builder ──────────────
+
+COMFY_OUTPUT = Path("/media/sf_AI_Ecosystem/02_Engines/ComfyUI/ComfyUI/output")
+PROMPTS_IMG_TXT = COMFY_OUTPUT / "prompts_img.txt"
+PROMPTS_VID_TXT = COMFY_OUTPUT / "video" / "prompts_vid.txt"
+PROMPT_LOG_JSON = Path("/media/sf_AI_Ecosystem/04_Data/prompt-log.json")
+
+
+def _parse_prompt_txt(path: Path, entry_type: str):
+    """Parse a prompts_*.txt file into a list of {type, positive, negative} dicts.
+
+    Entries separated by lines of dashes. Each entry has 'Positivo:' and 'Negativo:' headers.
+    Files use CRLF line endings.
+    """
+    if not path.exists():
+        return []
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        print(f"[prompts] Error reading {path}: {e}")
+        return []
+    # Normalize line endings
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    # Split on separator lines (10+ dashes, possibly surrounded by blank lines)
+    import re
+    parts = re.split(r"(?:^|\n)-{5,}\s*(?:\n|$)", raw)
+    entries = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        # Find Positivo: and Negativo: blocks
+        pos = ""
+        neg = ""
+        # Use regex with DOTALL to capture multi-line blocks until the next header
+        m_pos = re.search(r"Positivo:\s*(.*?)(?:\n\s*Negativo:|$)", part, re.DOTALL)
+        m_neg = re.search(r"Negativo:\s*(.*?)$", part, re.DOTALL)
+        if m_pos:
+            pos = m_pos.group(1).strip()
+        if m_neg:
+            neg = m_neg.group(1).strip()
+        # Skip fully-empty entries
+        if not pos and not neg:
+            continue
+        entries.append({
+            "type": entry_type,
+            "positive": pos,
+            "negative": neg,
+            "source": str(path.name),
+        })
+    return entries
+
+
+def _load_prompt_log_json():
+    """Load the JSON prompt log (list of user-saved entries)."""
+    if not PROMPT_LOG_JSON.exists():
+        return []
+    try:
+        data = json.loads(PROMPT_LOG_JSON.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return data
+        return []
+    except Exception as e:
+        print(f"[prompts] Error reading JSON log: {e}")
+        return []
+
+
+def _save_prompt_log_json(entries):
+    """Persist the JSON prompt log."""
+    PROMPT_LOG_JSON.parent.mkdir(parents=True, exist_ok=True)
+    PROMPT_LOG_JSON.write_text(
+        json.dumps(entries, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+@app.route("/api/tools/prompts/read")
+def api_tools_prompts_read():
+    """Return all prompt entries: image .txt + video .txt + JSON log (merged)."""
+    try:
+        entries = []
+        entries.extend(_parse_prompt_txt(PROMPTS_IMG_TXT, "image"))
+        entries.extend(_parse_prompt_txt(PROMPTS_VID_TXT, "video"))
+        for e in _load_prompt_log_json():
+            # Normalize JSON entries to include 'type' and 'positive'/'negative'
+            entries.append({
+                "type": e.get("type", "image"),
+                "positive": e.get("positive", e.get("prompt", "")),
+                "negative": e.get("negative", ""),
+                "filename": e.get("filename", ""),
+                "notes": e.get("notes", ""),
+                "source": "prompt-log.json",
+            })
+        return jsonify({"count": len(entries), "entries": entries})
+    except Exception as e:
+        return jsonify({"error": str(e), "entries": []}), 500
+
+
+@app.route("/api/tools/prompts/save", methods=["POST"])
+def api_tools_prompts_save():
+    """Append a new prompt entry to the JSON log."""
+    try:
+        data = request.get_json(force=True) or {}
+        filename = (data.get("filename") or "").strip()
+        ptype = (data.get("type") or "image").strip().lower()
+        if ptype not in ("image", "video"):
+            ptype = "image"
+        positive = (data.get("positive") or "").strip()
+        negative = (data.get("negative") or "").strip()
+        notes = (data.get("notes") or "").strip()
+        if not positive:
+            return jsonify({"error": "positive prompt is required"}), 400
+        entry = {
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "filename": filename,
+            "type": ptype,
+            "positive": positive,
+            "negative": negative,
+            "notes": notes,
+        }
+        entries = _load_prompt_log_json()
+        entries.append(entry)
+        _save_prompt_log_json(entries)
+        return jsonify({"success": True, "entry": entry, "total": len(entries)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/tools/prompts/lookup")
+def api_tools_prompts_lookup():
+    """Given a filename (image or video), find the best matching prompt entry.
+
+    Strategy:
+      1. Search JSON log for an exact filename match.
+      2. Derive the index from a numeric prefix in the filename (e.g. ComfyUI_00007_.mp4 → index 6)
+         and return the entry at that position from the relevant .txt file.
+      3. Return null if nothing matches.
+    """
+    import re as _re
+    try:
+        filename = (request.args.get("filename") or "").strip()
+        if not filename:
+            return jsonify({"match": None, "reason": "no filename provided"})
+        # Determine type from extension
+        ext = os.path.splitext(filename)[1].lower()
+        is_video = ext in (".mp4", ".webm", ".mov", ".avi", ".mkv")
+        is_image = ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
+        ptype = "video" if is_video else ("image" if is_image else "")
+
+        # 1. JSON log exact match
+        for e in _load_prompt_log_json():
+            if e.get("filename", "").lower() == filename.lower():
+                return jsonify({
+                    "match": {
+                        "type": e.get("type", ptype or "image"),
+                        "positive": e.get("positive", e.get("prompt", "")),
+                        "negative": e.get("negative", ""),
+                        "filename": e.get("filename", filename),
+                        "notes": e.get("notes", ""),
+                        "source": "prompt-log.json",
+                    },
+                    "reason": "json-exact",
+                })
+
+        # 2. Numeric-index match against .txt files
+        m = _re.search(r"(\d+)", os.path.basename(filename))
+        if m:
+            idx = int(m.group(1))
+            # Choose file by type; if unknown, try both
+            candidates = []
+            if ptype == "video" or ptype == "":
+                candidates.append((PROMPTS_VID_TXT, "video"))
+            if ptype == "image" or ptype == "":
+                candidates.append((PROMPTS_IMG_TXT, "image"))
+            for path, etype in candidates:
+                entries = _parse_prompt_txt(path, etype)
+                # Numbering observed: ComfyUI_00007_ → 7, but list is 1-indexed in the file.
+                # The .txt files appear to be appended in order, so index N (1-based) → entries[N-1].
+                # If filename uses 0-padding, the numeric value maps directly. Try 1-based first,
+                # then 0-based.
+                for offset in (1, 0):
+                    target = idx - offset
+                    if 0 <= target < len(entries):
+                        entry = entries[target]
+                        if entry.get("positive") or entry.get("negative"):
+                            return jsonify({
+                                "match": {
+                                    "type": etype,
+                                    "positive": entry.get("positive", ""),
+                                    "negative": entry.get("negative", ""),
+                                    "filename": filename,
+                                    "notes": "",
+                                    "source": path.name,
+                                    "index": target,
+                                },
+                                "reason": f"txt-index-{offset}",
+                            })
+        # 3. No match
+        return jsonify({"match": None, "reason": "no match found"})
+    except Exception as e:
+        return jsonify({"error": str(e), "match": None}), 500
+
+
+@app.route("/api/tools/prompt-builder/presets")
+def api_tools_prompt_builder_presets():
+    """Return presets for the Prompt Builder tool."""
+    presets = {
+        "camera_verbs": [
+            "camera tilts up", "camera push in", "camera pull back",
+            "camera pans left", "camera pans right",
+            "camera orbits right", "camera orbits left", "fixed camera",
+        ],
+        "movement_verbs": [
+            "surging", "churning", "crashing", "swirling",
+            "drifting", "flowing", "exploding", "flying",
+        ],
+        "weak_verbs_warning": ["smooth", "calm", "gentle"],
+        "motion_intensity": ["low", "medium", "high"],
+        "style_presets": {
+            "realistic": {
+                "positive_prefix": "masterpiece, best quality, photorealistic, 8k, highly detailed, raw photo,",
+                "negative": "(worst quality, low quality, bad quality:1.4), (blurry, blurred, out of focus:1.2), ugly, deformed, disfigured, extra limbs, bad anatomy, watermark, signature, text, jpeg artifacts, oversaturated, overexposed, illustration, painting, drawing, cartoon, 3d render, plastic, artificial",
+            },
+            "fantasy": {
+                "positive_prefix": "fantasy animation style, concept art, cartoon shading, whimsical, masterpiece, best quality, highly detailed,",
+                "negative": "photorealistic, realistic, photo, photograph, 3d render, octane render, text, watermark, blurry, low quality, worst quality, deformed, ugly, realistic skin, real person",
+            },
+            "animation": {
+                "positive_prefix": "masterpiece, best quality, highly detailed, 2d animation, cel shading, vibrant colors, studio anime quality,",
+                "negative": "photorealistic, realistic, photo, 3d render, text, watermark, blurry, low quality, worst quality, deformed, ugly",
+            },
+        },
+    }
+    return jsonify(presets)
+
+
+# ─── AI Prompt Builder — Ollama-powered prompt transformation ───
+
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://192.168.0.187:11434")
+
+def _build_prompt_system_message(ptype, style, camera_sel=None, movement_sel=None):
+    """Build a system prompt for the LLM that knows how to generate detailed prompts."""
+    type_desc = {
+        "image": "static image (single frame, no motion, focus on composition and detail)",
+        "video": "video (5 seconds, 81 frames, needs movement and camera motion)",
+        "music": "music (audio generation, needs genre, mood, instruments, tempo)",
+    }.get(ptype, "image")
+    
+    style_desc = {
+        "realistic": "photorealistic, natural colors, real-world textures, 35mm lens quality, National Geographic style",
+        "fantasy": "fantasy concept art, ethereal, magical, bioluminescent, glowing particles, floating runes, otherworldly, NOT photorealistic, clearly stylized",
+        "animation": "2D animation, cel shading, vibrant colors, clean linework, studio anime quality",
+    }.get(style, "realistic")
+    
+    camera_info = ""
+    if ptype == "video" and camera_sel:
+        camera_info = f"\n- Camera movement to include: {', '.join(camera_sel)}"
+    
+    movement_info = ""
+    if ptype == "video" and movement_sel:
+        movement_info = f"\n- Scene movement verbs to include: {', '.join(movement_sel)}"
+    
+    rules = f"""You are an expert prompt engineer for AI {'video' if ptype == 'video' else 'image'} generation using Wan 2.2 and SDXL models.
+
+Transform the user's scene description into a detailed, optimized positive prompt.
+
+CONTEXT:
+- Content type: {type_desc}
+- Visual style: {style_desc}{camera_info}{movement_info}
+
+RULES FOR {'VIDEO' if ptype == 'video' else 'IMAGE'} PROMPTS:"""
+
+    if ptype == "video":
+        rules += """
+- Add SPECIFIC movement verbs (surging, churning, crashing, swirling, drifting, exploding) — NEVER use smooth, calm, gentle (they kill motion)
+- Add camera movement description (camera tilts up, camera push in, camera pull back, camera pans, camera orbits)
+- Add stability terms: "consistent scene, stable composition"
+- Add temporal continuity terms: "continuous movement, seamless motion"
+- Describe DYNAMIC action, not static beauty
+- Add atmosphere and lighting suitable for video"""
+    else:
+        rules += """
+- Focus on composition, framing, and single-frame beauty
+- Add lens details (35mm, macro, wide-angle, etc.)
+- Add lighting (golden hour, volumetric light, soft light, etc.)
+- Add texture details (extremely detailed, hyper-detailed)
+- Add depth of field and focus descriptions
+- No motion or camera movement terms"""
+    
+    if style == "fantasy":
+        rules += """
+- Add fantasy elements: glowing particles, bioluminescent flora, ethereal mist, magical lighting, floating runes
+- Add "concept art, painterly, ethereal, magical, dreamlike atmosphere, clearly unrealistic, stylized"
+- Add "not photorealistic, not live footage" to distinguish from realistic"""
+    elif style == "realistic":
+        rules += """
+- Add "masterpiece, best quality, photorealistic, 8k, highly detailed, raw photo"
+- Add natural textures: "extremely detailed textures of stone, wood, water, fabric"
+- Add "natural colors" and avoid stylization terms"""
+    elif style == "animation":
+        rules += """
+- Add "2d animation, cel shading, vibrant colors, clean linework, studio anime quality"
+- Add "key visual quality, expressive composition"
+- Avoid photorealistic or 3D render terms"""
+
+    rules += """
+
+OUTPUT FORMAT:
+- Output ONLY the final positive prompt, nothing else
+- No explanations, no labels, no "Prompt:" prefix
+- Comma-separated tags and descriptive phrases
+- Keep it under 300 words
+- The prompt should be ready to paste directly into ComfyUI"""
+
+    return rules
+
+
+@app.route("/api/tools/prompt-builder/generate", methods=["POST"])
+def api_tools_prompt_builder_generate():
+    """Generate a detailed prompt using a local LLM via Ollama."""
+    data = request.json or {}
+    scene = (data.get("scene") or "").strip()
+    ptype = data.get("type", "image")
+    style = data.get("style", "realistic")
+    camera_sel = data.get("camera", [])
+    movement_sel = data.get("movement", [])
+    
+    if not scene:
+        return jsonify({"error": "Scene description is required"}), 400
+    
+    system_msg = _build_prompt_system_message(ptype, style, camera_sel, movement_sel)
+    
+    # Build the user message with context
+    user_msg = f"Scene description: {scene}"
+    if camera_sel:
+        user_msg += f"\nCamera: {', '.join(camera_sel)}"
+    if movement_sel:
+        user_msg += f"\nMovement: {', '.join(movement_sel)}"
+    user_msg += f"\nStyle: {style}\nType: {ptype}"
+    user_msg += "\n\nTransform this into a detailed positive prompt."
+    
+    payload = {
+        "model": "glm-5.2:cloud",
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        "stream": False,
+        "options": {"temperature": 0.7, "num_predict": 600},
+    }
+    
+    try:
+        resp = _requests.post(
+            f"{OLLAMA_HOST}/api/chat",
+            json=payload,
+            timeout=60,
+        )
+        result = resp.json()
+        content = result.get("message", {}).get("content", "").strip()
+        
+        if not content:
+            # Some models put output in "thinking" field
+            thinking = result.get("message", {}).get("thinking", "")
+            if thinking:
+                # Extract the last paragraph that looks like a prompt
+                lines = thinking.strip().split("\n")
+                content = lines[-1].strip() if lines else ""
+        
+        if not content:
+            return jsonify({"error": "LLM returned empty response"}), 502
+        
+        # Clean up: remove any "Prompt:" prefix or quotes
+        content = content.strip('"').strip("'")
+        for prefix in ["Prompt:", "Positive prompt:", "Positive:", "Here is", "Here's"]:
+            if content.lower().startswith(prefix.lower()):
+                content = content[len(prefix):].strip()
+        
+        # Generate negative prompt based on style
+        negative_presets = {
+            "realistic": "(worst quality, low quality, bad quality:1.4), (blurry, blurred, out of focus:1.2), ugly, deformed, disfigured, extra limbs, bad anatomy, watermark, signature, text, jpeg artifacts, oversaturated, overexposed, illustration, painting, drawing, cartoon, 3d render, plastic, artificial",
+            "fantasy": "photorealistic, realistic, photo, photograph, 3d render, octane render, text, watermark, blurry, low quality, worst quality, deformed, ugly, realistic skin, real person",
+            "animation": "photorealistic, realistic, photo, 3d render, text, watermark, blurry, low quality, worst quality, deformed, ugly",
+        }
+        negative = negative_presets.get(style, negative_presets["realistic"])
+        
+        if ptype == "video":
+            negative += ", motion smear, motion artifacts, flickering, jitter, warp, distortion, static, frozen, no motion"
+            if style == "fantasy":
+                negative += ", continuous streaks, persistent glow lines, uniform vertical streaks, ordered pattern, energy drizzle, lingering lightning"
+        
+        return jsonify({
+            "positive": content,
+            "negative": negative,
+            "model": result.get("model", "glm-5.2"),
+            "tokens": result.get("eval_count", 0),
+            "duration_s": round(result.get("total_duration", 0) / 1e9, 1),
+        })
+    except _requests.exceptions.Timeout:
+        return jsonify({"error": "LLM timeout (model may be loading)"}), 504
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ─── Start background threads ─────────────────────────
 
 # FASE A: Command Center — live terminal streaming
@@ -1450,6 +2407,253 @@ threading.Thread(target=sync_worker, daemon=True).start()
 threading.Thread(target=stream_worker, daemon=True).start()
 threading.Thread(target=cron_scheduler_worker, daemon=True).start()
 threading.Thread(target=orchestrator_subprocess_worker, daemon=True).start()
+
+# ── Scripts Panel (zero-token task management) ──
+
+TASKS_DIR = Path("/media/sf_AI_Ecosystem/10_Projects/02_AgentGUI/scripts")
+TASKS_DIR.mkdir(parents=True, exist_ok=True)
+_task_jobs = {}  # job_id -> {status, output, task_id, pid, finished}
+_task_jobs_lock = threading.Lock()
+_task_pids = {}  # task_id -> {pid, job_id}
+_task_pids_lock = threading.Lock()
+
+def _run_task_thread(job_id, task_id, script_path, lang):
+    try:
+        if lang == "bash":
+            cmd = ["bash", str(script_path)]
+        else:
+            cmd = ["/usr/bin/python3", str(script_path)]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        with _task_pids_lock:
+            _task_pids[task_id] = {"pid": proc.pid, "job_id": job_id}
+        stdout, _ = proc.communicate(timeout=3600)
+        rc = proc.returncode
+        with _task_jobs_lock:
+            _task_jobs[job_id] = {
+                "status": "done" if rc == 0 else "error",
+                "output": stdout or "",
+                "returncode": rc,
+                "task_id": task_id,
+                "finished": time.time(),
+            }
+        with _task_pids_lock:
+            _task_pids.pop(task_id, None)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        with _task_jobs_lock:
+            _task_jobs[job_id] = {"status": "error", "output": "Timeout (3600s)", "task_id": task_id, "finished": time.time()}
+        with _task_pids_lock:
+            _task_pids.pop(task_id, None)
+    except Exception as e:
+        with _task_jobs_lock:
+            _task_jobs[job_id] = {"status": "error", "output": str(e), "task_id": task_id, "finished": time.time()}
+        with _task_pids_lock:
+            _task_pids.pop(task_id, None)
+
+def _detect_lang(name):
+    if name.endswith(".sh") or name.endswith(".bash"): return "bash"
+    return "python"
+
+def _read_task_json(task_dir):
+    tj = task_dir / "task.json"
+    if not tj.exists():
+        return None
+    try:
+        return json.loads(tj.read_text(errors="replace"))
+    except:
+        return None
+
+def _is_task_running(task_id):
+    with _task_pids_lock:
+        info = _task_pids.get(task_id)
+        if not info:
+            return False
+        # Check if process is still alive
+        try:
+            os.kill(info["pid"], 0)
+            return True
+        except (ProcessLookupError, PermissionError):
+            _task_pids.pop(task_id, None)
+            return False
+
+@app.route("/api/scripts/list")
+def api_scripts_list():
+    try:
+        tasks = []
+        for d in TASKS_DIR.iterdir():
+            if not d.is_dir() or d.name.startswith("."):
+                continue
+            tj = _read_task_json(d)
+            if not tj:
+                continue
+            st = d.stat()
+            tasks.append({
+                "id": d.name,
+                "name": tj.get("name", d.name),
+                "description": tj.get("description", ""),
+                "entry_point": tj.get("entry_point", ""),
+                "files": tj.get("files", []),
+                "mtime": st.st_mtime,
+                "running": _is_task_running(d.name),
+            })
+        tasks.sort(key=lambda x: x["mtime"], reverse=True)
+        return jsonify({"tasks": tasks, "path": str(TASKS_DIR)})
+    except Exception as e:
+        return jsonify({"error": str(e), "tasks": []}), 500
+
+@app.route("/api/scripts/read")
+def api_scripts_read():
+    task_id = os.path.basename(request.args.get("task", ""))
+    filename = os.path.basename(request.args.get("file", ""))
+    if not task_id or not filename:
+        return jsonify({"error": "task and file required"}), 400
+    p = TASKS_DIR / task_id / filename
+    if not p.exists():
+        return jsonify({"error": "not found"}), 404
+    try:
+        content = p.read_text(errors="replace")
+        return jsonify({"content": content, "lang": _detect_lang(filename)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/scripts/save", methods=["POST"])
+def api_scripts_save():
+    data = request.json or {}
+    task_id = os.path.basename(data.get("task", ""))
+    filename = os.path.basename(data.get("file", ""))
+    content = data.get("content", "")
+    if not task_id or not filename:
+        return jsonify({"error": "task and file required"}), 400
+    p = TASKS_DIR / task_id / filename
+    try:
+        p.write_text(content)
+        return jsonify({"success": True, "size": p.stat().st_size})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/scripts/create", methods=["POST"])
+def api_scripts_create():
+    data = request.json or {}
+    name = data.get("name", "").strip()
+    desc = data.get("description", "").strip()
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    task_id = name.lower().replace(" ", "-").replace("/", "-")
+    d = TASKS_DIR / task_id
+    if d.exists():
+        return jsonify({"error": "already exists"}), 409
+    d.mkdir(parents=True)
+    entry = task_id.replace("-", "_") + ".py"
+    (d / entry).write_text("#!/usr/bin/env python3\n# " + name + "\n")
+    task_json = {
+        "name": name,
+        "description": desc,
+        "entry_point": entry,
+        "files": [{"path": entry, "desc": "Script principal"}],
+    }
+    (d / "task.json").write_text(json.dumps(task_json, indent=2))
+    return jsonify({"success": True, "task_id": task_id})
+
+@app.route("/api/scripts/delete")
+def api_scripts_delete():
+    task_id = os.path.basename(request.args.get("task", ""))
+    if not task_id:
+        return jsonify({"error": "task required"}), 400
+    if _is_task_running(task_id):
+        return jsonify({"error": "task is running"}), 409
+    d = TASKS_DIR / task_id
+    if not d.exists():
+        return jsonify({"error": "not found"}), 404
+    try:
+        import shutil
+        shutil.rmtree(d)
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/scripts/run", methods=["POST"])
+def api_scripts_run():
+    data = request.json or {}
+    task_id = os.path.basename(data.get("task", ""))
+    if not task_id:
+        return jsonify({"error": "task required"}), 400
+    if _is_task_running(task_id):
+        return jsonify({"error": "already running"}), 409
+    tj = _read_task_json(TASKS_DIR / task_id)
+    if not tj:
+        return jsonify({"error": "task.json not found"}), 404
+    entry = tj.get("entry_point", "")
+    script_path = TASKS_DIR / task_id / entry
+    if not script_path.exists():
+        return jsonify({"error": f"entry point not found: {entry}"}), 404
+    lang = _detect_lang(entry)
+    job_id = uuid.uuid4().hex
+    with _task_jobs_lock:
+        _task_jobs[job_id] = {"status": "running", "task_id": task_id, "started": time.time()}
+    threading.Thread(target=_run_task_thread, args=(job_id, task_id, str(script_path), lang), daemon=True).start()
+    return jsonify({"job_id": job_id, "task_id": task_id})
+
+@app.route("/api/scripts/stop", methods=["POST"])
+def api_scripts_stop():
+    data = request.json or {}
+    task_id = os.path.basename(data.get("task", ""))
+    if not task_id:
+        return jsonify({"error": "task required"}), 400
+    with _task_pids_lock:
+        info = _task_pids.get(task_id)
+        if not info:
+            return jsonify({"error": "not running"}), 404
+        try:
+            os.kill(info["pid"], 15)
+            _task_pids.pop(task_id, None)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    return jsonify({"success": True})
+
+@app.route("/api/scripts/request", methods=["POST"])
+def api_scripts_request():
+    """Dispatch to developer profile to build a script task."""
+    data = request.json or {}
+    name = data.get("name", "").strip()
+    desc = data.get("description", "").strip()
+    if not name or not desc:
+        return jsonify({"error": "name and description required"}), 400
+    task_id = name.lower().replace(" ", "-").replace("/", "-")
+    task_dir = TASKS_DIR / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    prompt = (
+        f"Cria um script em Python na pasta {task_dir}/ que faça o seguinte:\n\n"
+        f"{desc}\n\n"
+        f"Requisitos:\n"
+        f"- O script principal deve ser o entry point (ficheiro .py)\n"
+        f"- Cria um ficheiro task.json com: name, description, entry_point, files (lista de ficheiros com path e desc)\n"
+        f"- Testa o script para garantir que funciona antes de terminar\n"
+        f"- Se nao for possivel, cria task.json com description a explicar o motivo\n"
+        f"- Scripts Python correm com /usr/bin/python3\n"
+        f"- ComfyUI API em http://192.168.0.187:8188\n"
+        f"- Nao uses bibliotecas que nao estao instaladas (verifica com pip list ou tenta importar)"
+    )
+
+    result = _dispatch_task_impl({
+        "target_profile": "developer",
+        "task": prompt,
+        "caller_profile": "orchestrator",
+        "timeout": 600,
+    })
+
+    if "error" in result:
+        return jsonify({"error": result["error"]}), 500
+
+    return jsonify({"agent_id": result.get("agent_id"), "task_id": task_id, "status": "dispatched"})
+
+@app.route("/api/scripts/status/<job_id>")
+def api_scripts_status(job_id):
+    with _task_jobs_lock:
+        job = _task_jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "job not found"}), 404
+        return jsonify(job)
 
 # ─── Main ─────────────────────────────────────────────
 

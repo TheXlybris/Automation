@@ -1,38 +1,37 @@
-# Virtual environments
+# Ambiente virtual Python
 venv/
 env/
 ENV/
-node_modules/
 
-# Python cache
+# Cache Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 
-# Runtime state & logs
+# Logs
 *.log
-data/
-*_history.json
-*_inbox.json
-*_state.json
-*_summary.json
-*_mode.json
 
-# Secrets
+# Configuracoes locais
 .env
 .env.local
-*.key
-id_rsa*
 
-# Build artifacts (recreatable from react-frontend/)
-# Nota: static/ é INCLUIDO no repo para deploy-without-build
-# static/
+# Sistema operacional
+.DS_Store
+Thumbs.db
 
-# IDE / OS
+# IDEs
 .vscode/
 .idea/
 *.swp
 *.swo
-.DS_Store
-Thumbs.db
+
+# Outputs temporarios
+output_test.log
+
+# Pastas de output (imagens geradas nao vao para o repo)
+output/
+images/
+
+# Dependencias (se decidirmos usar requirements.txt no futuro)
+# requirements.txt

@@ -1,0 +1,23 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+# Bug-catchers only. Style noise (BLE001, S110, I001) ignored — existing code uses
+# broad excepts and unsorted imports throughout, changing that is churn on working code.
+select = [
+  "E",    # syntax errors
+  "F",    # pyflakes — undefined names, unused imports, unused vars
+  "W",    # warnings — deprecated, shadowed
+]
+ignore = [
+  "E501",   # line too long — codebase has long lines everywhere
+  "F401",   # unused import — codebase has conditional imports intentionally
+]
+
+[tool.ruff.lint.per-file-ignores]
+"server.py" = ["F841"]  # unused locals in endpoints — common pattern in Flask routes
+"video_endpoints.py" = ["F841"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
